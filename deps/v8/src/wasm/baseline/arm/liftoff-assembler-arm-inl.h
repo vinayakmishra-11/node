@@ -587,7 +587,7 @@ void LiftoffAssembler::PatchPrepareStackFrame(
     PushRegisters(regs_to_save);
     mov(WasmHandleStackOverflowDescriptor::GapRegister(), Operand(frame_size));
     add(WasmHandleStackOverflowDescriptor::FrameBaseRegister(), fp,
-        Operand(stack_param_slots * kStackSlotSize +
+        Operand(stack_param_slots * kSystemPointerSize +
                 CommonFrameConstants::kFixedFrameSizeAboveFp));
     CallBuiltin(Builtin::kWasmHandleStackOverflow);
     safepoint_table_builder->DefineSafepoint(this);
@@ -898,6 +898,16 @@ void LiftoffAssembler::LoadTaggedPointer(Register dst, Register src_addr,
   liftoff::LoadInternal(this, LiftoffRegister(dst), src_addr, offset_reg,
                         offset_imm, LoadType::kI32Load, protected_load_pc,
                         needs_shift);
+}
+
+void LiftoffAssembler::AtomicLoadTaggedPointer(Register dst, Register src_addr,
+                                               Register offset_reg,
+                                               int32_t offset_imm,
+                                               AtomicMemoryOrder memory_order,
+                                               uint32_t* protected_load_pc,
+                                               bool needs_shift) {
+  AtomicLoad(LiftoffRegister(dst), src_addr, offset_reg, offset_imm,
+             LoadType::kI32Load, {}, false);
 }
 
 void LiftoffAssembler::LoadProtectedPointer(Register dst, Register src_addr,
@@ -1288,6 +1298,14 @@ void LiftoffAssembler::AtomicStore(Register dst_addr, Register offset_reg,
   return;
 }
 
+void LiftoffAssembler::AtomicStoreTaggedPointer(
+    Register dst_addr, Register offset_reg, int32_t offset_imm, Register src,
+    LiftoffRegList pinned, AtomicMemoryOrder memory_order,
+    uint32_t* protected_store_pc) {
+  AtomicStore(dst_addr, offset_reg, offset_imm, LiftoffRegister(src),
+              StoreType::kI32Store, pinned, false);
+}
+
 void LiftoffAssembler::AtomicAdd(Register dst_addr, Register offset_reg,
                                  uint32_t offset_imm, LiftoffRegister value,
                                  LiftoffRegister result, StoreType type,
@@ -1365,6 +1383,42 @@ void LiftoffAssembler::AtomicExchange(Register dst_addr, Register offset_reg,
   }
   liftoff::AtomicBinop32(this, dst_addr, offset_reg, offset_imm, value, result,
                          type, &liftoff::Exchange);
+}
+
+void LiftoffAssembler::AtomicExchangeTaggedPointer(
+    Register dst_addr, Register offset_reg, uintptr_t offset_imm,
+    LiftoffRegister value, LiftoffRegister result, LiftoffRegList pinned) {
+  liftoff::AtomicOp32(this, dst_addr, offset_reg, offset_imm, value, result,
+                      pinned, &Assembler::ldrex, &Assembler::strex,
+                      &liftoff::Exchange);
+  if (v8_flags.disable_write_barriers) return;
+  // Emit the write barrier.
+  Label exit;
+  CheckPageFlag(dst_addr, MemoryChunk::kPointersFromHereAreInterestingMask,
+                kZero, &exit);
+  JumpIfSmi(value.gp(), &exit);
+  CheckPageFlag(value.gp(), MemoryChunk::kPointersToHereAreInterestingMask, eq,
+                &exit);
+
+  UseScratchRegisterScope temps{this};
+  Register actual_offset_reg = offset_reg;
+  if (offset_reg != no_reg && offset_imm != 0) {
+    if (cache_state()->is_used(LiftoffRegister(offset_reg))) {
+      // The code below only needs a scratch register if the {MemOperand} given
+      // to {str} has an offset outside the uint12 range. After doing the
+      // addition below we will not pass an immediate offset to {str} though, so
+      // we can use the scratch register here.
+      actual_offset_reg = temps.Acquire();
+    }
+    add(actual_offset_reg, offset_reg, Operand(offset_imm));
+  }
+
+  CallRecordWriteStubSaveRegisters(
+      dst_addr,
+      actual_offset_reg == no_reg ? Operand(offset_imm)
+                                  : Operand(actual_offset_reg),
+      SaveFPRegsMode::kSave, StubCallMode::kCallWasmRuntimeStub);
+  bind(&exit);
 }
 
 namespace liftoff {
@@ -4662,6 +4716,16 @@ bool LiftoffAssembler::emit_f16x8_qfms(LiftoffRegister dst,
 }
 
 bool LiftoffAssembler::supports_f16_mem_access() { return false; }
+
+void LiftoffAssembler::emit_inc_i32_at(Address address) {
+  LiftoffRegList pinned;
+  Register counter_addr = pinned.set(GetUnusedRegister(kGpReg, pinned)).gp();
+  Register value = GetUnusedRegister(kGpReg, pinned).gp();
+  mov(counter_addr, Operand(address));
+  ldr(value, MemOperand(counter_addr, 0));
+  add(value, value, Operand(1));
+  str(value, MemOperand(counter_addr, 0));
+}
 
 void LiftoffAssembler::StackCheck(Label* ool_code) {
   UseScratchRegisterScope temps(this);

@@ -1054,13 +1054,16 @@ Address grow_stack(Isolate* isolate, void* current_sp, size_t frame_size,
   // Check if this is a real stack overflow.
   StackLimitCheck check(isolate);
   if (check.WasmHasOverflowed(gap)) {
-    // If there is no parent, then the current stack is the main isolate stack.
     wasm::StackMemory* active_stack = isolate->isolate_data()->active_stack();
-    if (active_stack->jmpbuf()->parent == nullptr) {
+    if (isolate->IsOnCentralStack()) {
+      // Should not grow the central stack.
       return 0;
     }
     DCHECK(active_stack->IsActive());
-    if (!active_stack->Grow(current_fp)) {
+    // Grow by at least the new frame size plus the stack limit margin.
+    if (!active_stack->Grow(
+            current_fp,
+            gap + frame_size + StackMemory::JSStackLimitMarginKB() * KB)) {
       return 0;
     }
 

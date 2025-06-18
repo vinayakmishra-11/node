@@ -156,12 +156,13 @@
 // Internalized strings to be allocated early on the read only heap and early in
 // the roots table. Used to give this string a RootIndex < 32.
 #define EXTRA_IMPORTANT_INTERNALIZED_STRING_LIST_GENERATOR(V, _) \
-  V(_, empty_string, "")
+  V(_, empty_string, "")                                         \
+  V(_, prototype_string, "prototype")                            \
+  V(_, name_string, "name")                                      \
+  V(_, length_string, "length")
 
 // Internalized strings to be allocated early on the read only heap
 #define IMPORTANT_INTERNALIZED_STRING_LIST_GENERATOR(V, _) \
-  V(_, prototype_string, "prototype")                      \
-  V(_, name_string, "name")                                \
   V(_, enumerable_string, "enumerable")                    \
   V(_, configurable_string, "configurable")                \
   V(_, value_string, "value")                              \
@@ -600,6 +601,7 @@
   V(_, byte_offset_string, "byteOffset")                                      \
   V(_, CompileError_string, "CompileError")                                   \
   V(_, calendar_string, "calendar")                                           \
+  V(_, calendarId_string, "calendarId")                                       \
   V(_, callee_string, "callee")                                               \
   V(_, caller_string, "caller")                                               \
   V(_, cause_string, "cause")                                                 \
@@ -646,10 +648,8 @@
   V(_, Error_string, "Error")                                                 \
   V(_, EvalError_string, "EvalError")                                         \
   V(_, element_string, "element")                                             \
-  V(_, epochMicroseconds_string, "epochMicroseconds")                         \
   V(_, epochMilliseconds_string, "epochMilliseconds")                         \
   V(_, epochNanoseconds_string, "epochNanoseconds")                           \
-  V(_, epochSeconds_string, "epochSeconds")                                   \
   V(_, era_string, "era")                                                     \
   V(_, eraYear_string, "eraYear")                                             \
   V(_, error_string, "error")                                                 \
@@ -678,6 +678,7 @@
   V(_, getOwnPropertyDescriptor_string, "getOwnPropertyDescriptor")           \
   V(_, getPossibleInstantsFor_string, "getPossibleInstantsFor")               \
   V(_, getPrototypeOf_string, "getPrototypeOf")                               \
+  V(_, getTimeZoneTransition_string, "getTimeZoneTransition")                 \
   V(_, global_string, "global")                                               \
   V(_, globalThis_string, "globalThis")                                       \
   V(_, groups_string, "groups")                                               \
@@ -847,6 +848,7 @@
   V(_, throw_string, "throw")                                                 \
   V(_, timed_out_string, "timed-out")                                         \
   V(_, timeZone_string, "timeZone")                                           \
+  V(_, timeZoneId_string, "timeZoneId")                                       \
   V(_, toJSON_string, "toJSON")                                               \
   V(_, toString_string, "toString")                                           \
   V(_, true_string, "true")                                                   \
@@ -875,7 +877,8 @@
   V(_, written_string, "written")                                             \
   V(_, yearMonthFromFields_string, "yearMonthFromFields")                     \
   V(_, year_string, "year")                                                   \
-  V(_, years_string, "years")
+  V(_, years_string, "years")                                                 \
+  V(_, yearOfWeek_string, "yearOfWeek")
 
 #define INTERNALIZED_STRING_LIST_GENERATOR(V, _)           \
   EXTRA_IMPORTANT_INTERNALIZED_STRING_LIST_GENERATOR(V, _) \
@@ -949,7 +952,6 @@
 // These Names have to be allocated consecutively for fast checks,
 #define INTERNALIZED_STRING_FOR_PROTECTOR_LIST_GENERATOR(V, _) \
   V(_, constructor_string, "constructor")                      \
-  V(_, length_string, "length")                                \
   V(_, next_string, "next")                                    \
   V(_, resolve_string, "resolve")                              \
   V(_, then_string, "then")                                    \

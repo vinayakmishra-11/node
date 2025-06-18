@@ -111,6 +111,7 @@ CcTest::CcTest(TestFunction* callback, const char* file, const char* name,
 }
 
 void CcTest::Run(const char* snapshot_directory) {
+  // TODO(350324877): Investigate enabling sandbox hardware support here.
   v8::V8::InitializeICUDefaultLocation(snapshot_directory);
   std::unique_ptr<v8::Platform> underlying_default_platform(
       v8::platform::NewDefaultPlatform());
@@ -250,17 +251,14 @@ LocalContext::~LocalContext() {
   context_.Reset();
 }
 
-void LocalContext::Initialize(v8::Isolate* isolate,
-                              v8::ExtensionConfiguration* extensions,
+void LocalContext::Initialize(v8::ExtensionConfiguration* extensions,
                               v8::Local<v8::ObjectTemplate> global_template,
                               v8::Local<v8::Value> global_object) {
-  v8::HandleScope scope(isolate);
+  v8::HandleScope scope(isolate_);
   v8::Local<v8::Context> context =
-      v8::Context::New(isolate, extensions, global_template, global_object);
-  context_.Reset(isolate, context);
+      v8::Context::New(isolate_, extensions, global_template, global_object);
+  context_.Reset(isolate_, context);
   context->Enter();
-  // We can't do this later perhaps because of a fatal error.
-  isolate_ = isolate;
 }
 
 // This indirection is needed because HandleScopes cannot be heap-allocated, and
@@ -281,9 +279,8 @@ InitializedHandleScope::InitializedHandleScope(i::Isolate* isolate)
 
 InitializedHandleScope::~InitializedHandleScope() = default;
 
-HandleAndZoneScope::HandleAndZoneScope(bool support_zone_compression)
-    : main_zone_(
-          new i::Zone(&allocator_, ZONE_NAME, support_zone_compression)) {}
+HandleAndZoneScope::HandleAndZoneScope()
+    : main_zone_(new i::Zone(&allocator_, ZONE_NAME)) {}
 
 HandleAndZoneScope::~HandleAndZoneScope() = default;
 
@@ -461,6 +458,10 @@ bool TestPlatform::IdleTasksEnabled(v8::Isolate* isolate) {
 
 v8::TracingController* TestPlatform::GetTracingController() {
   return CcTest::default_platform()->GetTracingController();
+}
+
+v8::ThreadIsolatedAllocator* TestPlatform::GetThreadIsolatedAllocator() {
+  return CcTest::default_platform()->GetThreadIsolatedAllocator();
 }
 
 namespace {

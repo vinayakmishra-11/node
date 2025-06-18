@@ -4,6 +4,7 @@
 
 #include <fstream>
 
+#include "src/builtins/builtins-effects-analyzer.h"
 #include "src/builtins/builtins-inl.h"
 #include "src/builtins/profile-data-reader.h"
 #include "src/codegen/assembler-inl.h"
@@ -43,6 +44,37 @@ BUILTIN_LIST_C(FORWARD_DECLARE)
 #undef FORWARD_DECLARE
 
 namespace {
+
+#if V8_ENABLE_GEARBOX
+class InstructionSetExtensionScope {
+ public:
+  InstructionSetExtensionScope() {
+#if DEBUG
+    old_features = CpuFeatures::SupportedFeatures();
+#else
+    unsigned old_features = CpuFeatures::SupportedFeatures();
+#endif
+    CpuFeatures::SetSupported(SSE4_1);
+    unsigned new_features = CpuFeatures::SupportedFeatures();
+    if (new_features != old_features) is_set = true;
+  }
+
+  ~InstructionSetExtensionScope() {
+    if (is_set) {
+      CpuFeatures::SetUnsupported(SSE4_1);
+      is_set = false;
+    }
+    DCHECK_EQ(CpuFeatures::SupportedFeatures(), old_features);
+  }
+
+ private:
+  bool is_set = false;
+#if DEBUG
+  unsigned old_features = 0;
+#endif
+};
+
+#endif  // V8_ENABLE_GEARBOX
 
 using BuiltinCompilationScheduler =
     compiler::CodeAssembler::BuiltinCompilationScheduler;
@@ -269,6 +301,12 @@ void CompileCSLinkageCodeStubBuiltin(Isolate* isolate, Builtin builtin,
                                      BuiltinCompilationScheduler& scheduler) {
   // TODO(nicohartmann): Remove this once `BuildWithTurboshaftAssemblerCS` has
   // an actual use.
+#if V8_ENABLE_GEARBOX
+  std::optional<InstructionSetExtensionScope> isx_scope;
+  if (Builtins::IsISXVariant(builtin)) {
+    isx_scope.emplace();
+  }
+#endif  // V8_ENABLE_GEARBOX
   USE(&BuildWithTurboshaftAssemblerCS);
   std::unique_ptr<TurbofanCompilationJob> job(
       compiler::Pipeline::NewCSLinkageCodeStubBuiltinCompilationJob(
@@ -373,9 +411,15 @@ void SetupIsolateDelegate::ReplacePlaceholders(Isolate* isolate) {
 }
 
 // static
-void SetupIsolateDelegate::SetupBuiltinsInternal(Isolate* isolate) {
+void SetupIsolateDelegate::SetupBuiltinsInternal(
+    Isolate* isolate, bool compute_builtins_effects) {
   Builtins* builtins = isolate->builtins();
   DCHECK(!builtins->initialized_);
+
+  BuiltinsEffectsAnalyzer* builtins_effects_analyzer = nullptr;
+  if (compute_builtins_effects) {
+    builtins_effects_analyzer = BuiltinsEffectsAnalyzer::Setup(isolate);
+  }
 
   if (v8_flags.dump_builtins_hashes_to_file) {
     // Create an empty file.
@@ -488,6 +532,11 @@ void SetupIsolateDelegate::SetupBuiltinsInternal(Isolate* isolate) {
   scheduler.AwaitAndFinalizeCurrentBatch(isolate);
   CHECK_EQ(Builtins::kBuiltinCount, builtins_built_without_job_count +
                                         scheduler.builtins_installed_count());
+
+  if (compute_builtins_effects) {
+    DCHECK_NOT_NULL(builtins_effects_analyzer);
+    builtins_effects_analyzer->Finalize();
+  }
 
   // Add the generated builtins to the isolate.
   for (Builtin builtin = Builtins::kFirst; builtin <= Builtins::kLast;

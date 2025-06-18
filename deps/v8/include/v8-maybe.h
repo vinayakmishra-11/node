@@ -32,6 +32,8 @@ V8_EXPORT void FromJustIsNothing();
 template <class T>
 class Maybe : public cppgc::internal::ConditionalStackAllocatedBase<T> {
  public:
+  constexpr Maybe() = default;
+
   V8_INLINE bool IsNothing() const { return !has_value_; }
   V8_INLINE bool IsJust() const { return has_value_; }
 
@@ -54,6 +56,16 @@ class Maybe : public cppgc::internal::ConditionalStackAllocatedBase<T> {
    */
   V8_WARN_UNUSED_RESULT V8_INLINE bool To(T* out) const {
     if (V8_LIKELY(IsJust())) *out = value_;
+    return IsJust();
+  }
+
+  /**
+   * Converts this Maybe<> to a value of type T, moving out of it. If this
+   * Maybe<> is nothing (empty), |false| is returned and |out| is left
+   * untouched.
+   */
+  V8_WARN_UNUSED_RESULT V8_INLINE bool MoveTo(T* out) && {
+    if (V8_LIKELY(IsJust())) *out = std::move(value_);
     return IsJust();
   }
 
@@ -93,15 +105,12 @@ class Maybe : public cppgc::internal::ConditionalStackAllocatedBase<T> {
   }
 
  private:
-  Maybe() : has_value_(false) {}
   explicit Maybe(const T& t) : has_value_(true), value_(t) {}
   explicit Maybe(T&& t) : has_value_(true), value_(std::move(t)) {}
 
-  bool has_value_;
+  bool has_value_ = false;
   T value_;
 
-  template <class U>
-  friend Maybe<U> Nothing();
   template <class U>
   friend Maybe<U> Just(const U& u);
   template <class U, std::enable_if_t<!std::is_lvalue_reference_v<U>>*>
@@ -109,8 +118,8 @@ class Maybe : public cppgc::internal::ConditionalStackAllocatedBase<T> {
 };
 
 template <class T>
-inline Maybe<T> Nothing() {
-  return Maybe<T>();
+inline constexpr Maybe<T> Nothing() {
+  return {};
 }
 
 template <class T>
@@ -130,6 +139,8 @@ inline Maybe<T> Just(T&& t) {
 template <>
 class Maybe<void> {
  public:
+  constexpr Maybe() = default;
+
   V8_INLINE bool IsNothing() const { return !is_valid_; }
   V8_INLINE bool IsJust() const { return is_valid_; }
 
@@ -144,13 +155,10 @@ class Maybe<void> {
  private:
   struct JustTag {};
 
-  Maybe() : is_valid_(false) {}
   explicit Maybe(JustTag) : is_valid_(true) {}
 
-  bool is_valid_;
+  bool is_valid_ = false;
 
-  template <class U>
-  friend Maybe<U> Nothing();
   friend Maybe<void> JustVoid();
 };
 

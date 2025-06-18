@@ -831,7 +831,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
         Address wasm_code = static_cast<Address>(constant.ToInt64());
         __ Jump(wasm_code, constant.rmode());
       } else {
-        __ AddWord(kScratchReg, i.InputOrZeroRegister(0), 0);
+        __ Move(kScratchReg, i.InputOrZeroRegister(0));
         if (arch_opcode == kArchTailCallWasmIndirect) {
           __ CallWasmCodePointer(
               i.InputRegister(0),
@@ -916,10 +916,10 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     case kArchPrepareTailCall:
       AssemblePrepareTailCall();
       break;
-    case kArchCallCFunctionWithFrameState:
     case kArchCallCFunction: {
-      int const num_gp_parameters = ParamField::decode(instr->opcode());
-      int const num_fp_parameters = FPParamField::decode(instr->opcode());
+      uint32_t param_counts = i.InputUint32(instr->InputCount() - 1);
+      int const num_gp_parameters = ParamField::decode(param_counts);
+      int const num_fp_parameters = FPParamField::decode(param_counts);
       Label return_location;
       SetIsolateDataSlots set_isolate_data_slots = SetIsolateDataSlots::kYes;
 #if V8_ENABLE_WEBASSEMBLY
@@ -946,9 +946,10 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       }
       RecordSafepoint(instr->reference_map(), pc_offset);
 
-      bool const needs_frame_state =
-          (arch_opcode == kArchCallCFunctionWithFrameState);
-      if (needs_frame_state) {
+      if (instr->HasCallDescriptorFlag(CallDescriptor::kHasExceptionHandler)) {
+        handlers_.push_back({nullptr, pc_offset});
+      }
+      if (instr->HasCallDescriptorFlag(CallDescriptor::kNeedsFrameState)) {
         RecordDeoptInfo(instr, pc_offset);
       }
 
@@ -998,7 +999,6 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
                        SourceLocation());
       break;
     case kArchNop:
-    case kArchThrowTerminator:
       // don't emit code for nops.
       break;
     case kArchDeoptimize: {
@@ -1072,6 +1072,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     }
     case kArchAtomicStoreWithWriteBarrier: {
 #ifdef V8_TARGET_ARCH_RISCV64
+      MacroAssembler::BlockTrampolinePoolScope block_trampoline_pool(masm());
       RecordWriteMode mode = RecordWriteModeField::decode(instr->opcode());
       // Indirect pointer writes must use a different opcode.
       DCHECK_NE(mode, RecordWriteMode::kValueIsIndirectPointer);
@@ -1082,7 +1083,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       auto ool = zone()->New<OutOfLineRecordWrite>(
           this, object, Operand(offset), value, mode, DetermineStubCallMode());
       __ AddWord(kScratchReg, object, offset);
-      __ AtomicStoreTaggedField(value, MemOperand(kScratchReg, 0));
+      __ AtomicStoreTaggedField(value, MemOperand(kScratchReg, 0), trapper);
       // Skip the write barrier if the value is a Smi. However, this is only
       // valid if the value isn't an indirect pointer. Otherwise the value will
       // be a pointer table index, which will always look like a Smi (but
@@ -1203,20 +1204,28 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       __ MulOverflow32(i.OutputRegister(), i.InputOrZeroRegister(0),
                        i.InputOperand(1), kScratchReg);
       break;
+    case kRiscvAddOvfWord:
+      __ AddOverflowWord(i.OutputRegister(), i.InputOrZeroRegister(0),
+                         i.InputOperand(1), kScratchReg);
+      break;
+    case kRiscvSubOvfWord:
+      __ SubOverflowWord(i.OutputRegister(), i.InputOrZeroRegister(0),
+                         i.InputOperand(1), kScratchReg);
+      break;
 #if V8_TARGET_ARCH_RISCV64
     case kRiscvAdd64:
       __ AddWord(i.OutputRegister(), i.InputOrZeroRegister(0),
                  i.InputOperand(1));
       break;
-    case kRiscvAddOvf64:
-      __ AddOverflow64(i.OutputRegister(), i.InputOrZeroRegister(0),
+    case kRiscvAddOvf32:
+      __ AddOverflow32(i.OutputRegister(), i.InputOrZeroRegister(0),
                        i.InputOperand(1), kScratchReg);
       break;
     case kRiscvSub64:
       __ Sub64(i.OutputRegister(), i.InputOrZeroRegister(0), i.InputOperand(1));
       break;
-    case kRiscvSubOvf64:
-      __ SubOverflow64(i.OutputRegister(), i.InputOrZeroRegister(0),
+    case kRiscvSubOvf32:
+      __ SubOverflow32(i.OutputRegister(), i.InputOrZeroRegister(0),
                        i.InputOperand(1), kScratchReg);
       break;
     case kRiscvMulHigh32:
@@ -1287,14 +1296,6 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
                 i.InputOperand(1));
       break;
 #elif V8_TARGET_ARCH_RISCV32
-    case kRiscvAddOvf:
-      __ AddOverflow(i.OutputRegister(), i.InputOrZeroRegister(0),
-                     i.InputOperand(1), kScratchReg);
-      break;
-    case kRiscvSubOvf:
-      __ SubOverflow(i.OutputRegister(), i.InputOrZeroRegister(0),
-                     i.InputOperand(1), kScratchReg);
-      break;
     case kRiscvMulHigh32:
       __ Mulh(i.OutputRegister(), i.InputOrZeroRegister(0), i.InputOperand(1));
       break;
@@ -2225,6 +2226,20 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       ASSEMBLE_ATOMIC_STORE_INTEGER(Sw);
       break;
 #if V8_TARGET_ARCH_RISCV32
+    case kAtomicExchangeWithWriteBarrier: {
+      ASSEMBLE_ATOMIC_EXCHANGE_INTEGER(Ll, Sc);
+      Register object = i.InputRegister(0);
+      Register offset = i.InputRegister(1);
+      Register value = i.InputRegister(2);
+      RecordWriteMode mode = RecordWriteMode::kValueIsAny;
+      auto ool = zone()->New<OutOfLineRecordWrite>(
+          this, object, Operand(offset), value, mode, DetermineStubCallMode());
+      __ JumpIfSmi(value, ool->exit());
+      __ CheckPageFlag(object, MemoryChunk::kPointersFromHereAreInterestingMask,
+                       ne, ool->entry());
+      __ bind(ool->exit());
+      break;
+    }
     case kRiscvWord32AtomicPairLoad: {
       FrameScope scope(masm(), StackFrame::MANUAL);
       __ AddWord(a0, i.InputRegister(0), i.InputRegister(1));
@@ -2332,6 +2347,28 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     case kRiscvWord64AtomicExchangeUint64:
       ASSEMBLE_ATOMIC_EXCHANGE_INTEGER(Lld, Scd);
       break;
+    case kAtomicExchangeWithWriteBarrier: {
+      if constexpr (COMPRESS_POINTERS_BOOL) {
+        ASSEMBLE_ATOMIC_EXCHANGE_INTEGER(Ll, Sc);
+        __ AddWord(i.OutputRegister(), i.OutputRegister(),
+                   kPtrComprCageBaseRegister);
+      } else {
+        ASSEMBLE_ATOMIC_EXCHANGE_INTEGER(Lld, Scd);
+      }
+      if (v8_flags.disable_write_barriers) break;
+      // Emit the write barrier.
+      Register object = i.InputRegister(0);
+      Register offset = i.InputRegister(1);
+      Register value = i.InputRegister(2);
+      auto ool = zone()->New<OutOfLineRecordWrite>(
+          this, object, Operand(offset), value, RecordWriteMode::kValueIsAny,
+          DetermineStubCallMode());
+      __ JumpIfSmi(value, ool->exit());
+      __ CheckPageFlag(object, MemoryChunk::kPointersFromHereAreInterestingMask,
+                       ne, ool->entry());
+      __ bind(ool->exit());
+      break;
+    }
 #endif
     case kAtomicCompareExchangeInt8:
       DCHECK_EQ(AtomicWidthField::decode(opcode), AtomicWidth::kWord32);
@@ -2501,13 +2538,15 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       __ StoreIndirectPointerField(i.InputOrZeroRegister(0), mem, trapper);
       break;
     }
-    case kRiscvAtomicLoadDecompressTaggedSigned:
+    case kRiscvAtomicLoadDecompressTaggedSigned: {
       __ AtomicDecompressTaggedSigned(i.OutputRegister(), i.MemoryOperand(),
                                       trapper);
       break;
-    case kRiscvAtomicLoadDecompressTagged:
+    }
+    case kRiscvAtomicLoadDecompressTagged: {
       __ AtomicDecompressTagged(i.OutputRegister(), i.MemoryOperand(), trapper);
       break;
+    }
     case kRiscvAtomicStoreCompressTagged: {
       size_t index = 0;
       MemOperand mem = i.MemoryOperand(&index);
@@ -3865,11 +3904,13 @@ void AssembleBranchToLabels(CodeGenerator* gen, MacroAssembler* masm,
     __ Sra64(kScratchReg, i.OutputRegister(), 32);
     __ Sra32(kScratchReg2, i.OutputRegister(), 31);
     __ Branch(tlabel, cc, kScratchReg2, Operand(kScratchReg));
-  } else if (instr->arch_opcode() == kRiscvAddOvf64 ||
-             instr->arch_opcode() == kRiscvSubOvf64) {
+  } else if (instr->arch_opcode() == kRiscvAddOvf32 ||
+             instr->arch_opcode() == kRiscvSubOvf32 ||
+             instr->arch_opcode() == kRiscvAddOvfWord ||
+             instr->arch_opcode() == kRiscvSubOvfWord) {
 #elif V8_TARGET_ARCH_RISCV32
-  } else if (instr->arch_opcode() == kRiscvAddOvf ||
-             instr->arch_opcode() == kRiscvSubOvf) {
+  } else if (instr->arch_opcode() == kRiscvAddOvfWord ||
+             instr->arch_opcode() == kRiscvSubOvfWord) {
 #endif
     switch (condition) {
       // Overflow occurs if overflow register is negative
@@ -4065,11 +4106,13 @@ void CodeGenerator::AssembleArchBoolean(Instruction* instr,
     if (cc == eq)  // Toggle result for not overflow.
       __ Xor(result, result, 1);
     return;
-  } else if (instr->arch_opcode() == kRiscvAddOvf64 ||
-             instr->arch_opcode() == kRiscvSubOvf64) {
+  } else if (instr->arch_opcode() == kRiscvAddOvf32 ||
+             instr->arch_opcode() == kRiscvSubOvf32 ||
+             instr->arch_opcode() == kRiscvAddOvfWord ||
+             instr->arch_opcode() == kRiscvSubOvfWord) {
 #elif V8_TARGET_ARCH_RISCV32
-  } else if (instr->arch_opcode() == kRiscvAddOvf ||
-             instr->arch_opcode() == kRiscvSubOvf) {
+  } else if (instr->arch_opcode() == kRiscvAddOvfWord ||
+             instr->arch_opcode() == kRiscvSubOvfWord) {
 #endif
     // Overflow occurs if overflow register is negative
     __ Slt(result, kScratchReg, zero_reg);
@@ -4738,6 +4781,23 @@ void CodeGenerator::SetPendingMove(MoveOperands* move) {
   }
 }
 
+namespace {
+bool Is32BitOperand(InstructionOperand* operand) {
+  DCHECK(operand->IsStackSlot() || operand->IsRegister());
+  MachineRepresentation mr = LocationOperand::cast(operand)->representation();
+  return mr == MachineRepresentation::kWord32 ||
+         mr == MachineRepresentation::kCompressed ||
+         mr == MachineRepresentation::kCompressedPointer;
+}
+
+// When we need only 32 bits, move only 32 bits, otherwise the destination
+// register' upper 32 bits may contain dirty data.
+bool Use32BitMove(InstructionOperand* source, InstructionOperand* destination) {
+  return Is32BitOperand(source) && Is32BitOperand(destination);
+}
+
+}  // namespace
+
 void CodeGenerator::AssembleMove(InstructionOperand* source,
                                  InstructionOperand* destination) {
   RiscvOperandConverter g(this, nullptr);
@@ -4755,7 +4815,11 @@ void CodeGenerator::AssembleMove(InstructionOperand* source,
     DCHECK(destination->IsRegister() || destination->IsStackSlot());
     MemOperand src = g.ToMemOperand(source);
     if (destination->IsRegister()) {
-      __ LoadWord(g.ToRegister(destination), src);
+      if (Use32BitMove(source, destination)) {
+        __ Lw(g.ToRegister(destination), src);
+      } else {
+        __ LoadWord(g.ToRegister(destination), src);
+      }
     } else {
       Register temp = kScratchReg;
       __ LoadWord(temp, src);

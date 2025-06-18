@@ -71,8 +71,8 @@ class WasmWrapperTSGraphBuilder : public WasmGraphBuilderBase {
     IF_NOT (condition) {
       V<Number> message_id =
           __ NumberConstant(static_cast<int32_t>(abort_reason));
-      CallRuntime(__ phase_zone(), Runtime::kAbort, {message_id},
-                  __ NoContextConstant());
+      __ WasmCallRuntime(__ phase_zone(), Runtime::kAbort, {message_id},
+                         __ NoContextConstant());
     }
   }
 
@@ -410,11 +410,11 @@ class WasmWrapperTSGraphBuilder : public WasmGraphBuilderBase {
     return jsval;
   }
 
-  void BuildJSToWasmWrapper(
-      bool do_conversion = true,
-      compiler::turboshaft::OptionalOpIndex frame_state =
-          compiler::turboshaft::OptionalOpIndex::Nullopt(),
-      bool set_in_wasm_flag = true) {
+  void BuildJSToWasmWrapper(bool receiver_is_first_param) {
+    const bool do_conversion = true;
+    const compiler::turboshaft::OptionalOpIndex frame_state =
+        compiler::turboshaft::OptionalOpIndex::Nullopt();
+    const bool set_in_wasm_flag = true;
     const int wasm_param_count = static_cast<int>(sig_->parameter_count());
 
     __ Bind(__ NewBlock());
@@ -440,8 +440,8 @@ class WasmWrapperTSGraphBuilder : public WasmGraphBuilderBase {
       // Throw a TypeError. Use the js_context of the calling javascript
       // function (passed as a parameter), such that the generated code is
       // js_context independent.
-      CallRuntime(__ phase_zone(), Runtime::kWasmThrowJSTypeError, {},
-                  js_context);
+      __ WasmCallRuntime(__ phase_zone(), Runtime::kWasmThrowJSTypeError, {},
+                         js_context);
       __ Unreachable();
       return;
     }
@@ -457,8 +457,10 @@ class WasmWrapperTSGraphBuilder : public WasmGraphBuilderBase {
     // Prepare Param() nodes. Param() nodes can only be created once,
     // so we need to use the same nodes along all possible transformation paths.
     base::SmallVector<OpIndex, 16> params(args_count);
+    const int param_offset = receiver_is_first_param ? 0 : 1;
     for (int i = 0; i < wasm_param_count; ++i) {
-      params[i + 1] = __ Parameter(i + 1, RegisterRepresentation::Tagged());
+      params[i] =
+          __ Parameter(i + param_offset, RegisterRepresentation::Tagged());
     }
 
     Label<Object> done(&Asm());
@@ -470,13 +472,13 @@ class WasmWrapperTSGraphBuilder : public WasmGraphBuilderBase {
       // fast is encountered, skip checking the rest and fall back to the slow
       // path.
       for (int i = 0; i < wasm_param_count; ++i) {
-        CanTransformFast(params[i + 1], sig_->GetParam(i), slow_path);
+        CanTransformFast(params[i], sig_->GetParam(i), slow_path);
       }
       // Convert JS parameters to wasm numbers using the fast transformation
       // and build the call.
       base::SmallVector<OpIndex, 16> args(args_count);
       for (int i = 0; i < wasm_param_count; ++i) {
-        OpIndex wasm_param = FromJSFast(params[i + 1], sig_->GetParam(i));
+        OpIndex wasm_param = FromJSFast(params[i], sig_->GetParam(i));
         args[i + 1] = wasm_param;
       }
       jsval =
@@ -491,9 +493,9 @@ class WasmWrapperTSGraphBuilder : public WasmGraphBuilderBase {
     for (int i = 0; i < wasm_param_count; ++i) {
       if (do_conversion) {
         args[i + 1] =
-            FromJS(params[i + 1], js_context, sig_->GetParam(i), frame_state);
+            FromJS(params[i], js_context, sig_->GetParam(i), frame_state);
       } else {
-        OpIndex wasm_param = params[i + 1];
+        OpIndex wasm_param = params[i];
 
         // For Float32 parameters
         // we set UseInfo::CheckedNumberOrOddballAsFloat64 in
@@ -539,7 +541,8 @@ class WasmWrapperTSGraphBuilder : public WasmGraphBuilderBase {
       // =======================================================================
       // === Runtime TypeError =================================================
       // =======================================================================
-      CallRuntime(zone_, Runtime::kWasmThrowJSTypeError, {}, native_context);
+      __ WasmCallRuntime(zone_, Runtime::kWasmThrowJSTypeError, {},
+                         native_context);
       __ Unreachable();
       return;
     }
@@ -576,10 +579,7 @@ class WasmWrapperTSGraphBuilder : public WasmGraphBuilderBase {
       // =======================================================================
       // === JS Functions ======================================================
       // =======================================================================
-      case ImportCallKind::kJSFunctionArityMatch:
-        DCHECK_EQ(expected_arity, wasm_count);
-        [[fallthrough]];
-      case ImportCallKind::kJSFunctionArityMismatch: {
+      case ImportCallKind::kJSFunction: {
         auto call_descriptor = compiler::Linkage::GetJSCallDescriptor(
             __ graph_zone(), false, pushed_count + 1, CallDescriptor::kNoFlags);
         const TSCallDescriptor* ts_call_descriptor = TSCallDescriptor::Create(
@@ -857,8 +857,8 @@ class WasmWrapperTSGraphBuilder : public WasmGraphBuilderBase {
     __ GotoIf(check, done, BranchHint::kTrue);
     __ Goto(type_error);
     __ Bind(type_error);
-    CallRuntime(__ phase_zone(), Runtime::kWasmThrowJSTypeError, {},
-                js_context);
+    __ WasmCallRuntime(__ phase_zone(), Runtime::kWasmThrowJSTypeError, {},
+                       js_context);
     __ Unreachable();
     __ Bind(done);
     return result;
@@ -944,8 +944,8 @@ class WasmWrapperTSGraphBuilder : public WasmGraphBuilderBase {
           case HeapType::kExtern: {
             if (type.kind() == kRef) {
               IF (UNLIKELY(__ TaggedEqual(input, LOAD_ROOT(NullValue)))) {
-                CallRuntime(__ phase_zone(), Runtime::kWasmThrowJSTypeError, {},
-                            context);
+                __ WasmCallRuntime(__ phase_zone(),
+                                   Runtime::kWasmThrowJSTypeError, {}, context);
                 __ Unreachable();
               }
             }
@@ -963,9 +963,9 @@ class WasmWrapperTSGraphBuilder : public WasmGraphBuilderBase {
                   std::initializer_list<const OpIndex> inputs = {
                       input, __ IntPtrConstant(IntToSmi(
                                  static_cast<int>(type.raw_bit_field())))};
-                  GOTO(done, CallRuntime(__ phase_zone(),
-                                         Runtime::kWasmJSToWasmObject, inputs,
-                                         context));
+                  GOTO(done, __ WasmCallRuntime(__ phase_zone(),
+                                                Runtime::kWasmJSToWasmObject,
+                                                inputs, context));
                 }
               }
               GOTO(done, input);
@@ -996,8 +996,8 @@ class WasmWrapperTSGraphBuilder : public WasmGraphBuilderBase {
             std::initializer_list<const OpIndex> inputs = {
                 input, __ IntPtrConstant(
                            IntToSmi(static_cast<int>(type.raw_bit_field())))};
-            return CallRuntime(__ phase_zone(), Runtime::kWasmJSToWasmObject,
-                               inputs, context);
+            return __ WasmCallRuntime(
+                __ phase_zone(), Runtime::kWasmJSToWasmObject, inputs, context);
           }
         }
       }
@@ -1176,12 +1176,16 @@ class WasmWrapperTSGraphBuilder : public WasmGraphBuilderBase {
     OpIndex promise = __ Call(promise_resolve, OpIndex::Invalid(),
                               base::VectorOf(resolve_args), resolve_call_desc);
 
-    OpIndex suspender = LOAD_ROOT(ActiveSuspender);
-    IF (__ TaggedEqual(suspender, LOAD_ROOT(UndefinedValue))) {
+    OpIndex suspender =
+        __ Load(__ LoadRootRegister(), LoadOp::Kind::RawAligned(),
+                MemoryRepresentation::AnyUncompressedTagged(),
+                IsolateData::active_suspender_offset());
+
+    IF (__ TaggedEqual(suspender, __ SmiConstant(Smi::zero()))) {
       V<Smi> error = __ SmiConstant(Smi::FromInt(
           static_cast<int32_t>(MessageTemplate::kWasmSuspendError)));
-      CallRuntime(__ phase_zone(), Runtime::kThrowWasmSuspendError, {error},
-                  native_context);
+      __ WasmCallRuntime(__ phase_zone(), Runtime::kThrowWasmSuspendError,
+                         {error}, native_context);
       __ Unreachable();
     }
     if (v8_flags.stress_wasm_stack_switching) {
@@ -1191,8 +1195,8 @@ class WasmWrapperTSGraphBuilder : public WasmGraphBuilderBase {
       IF (for_stress_testing) {
         V<Smi> error = __ SmiConstant(Smi::FromInt(
             static_cast<int32_t>(MessageTemplate::kWasmSuspendJSFrames)));
-        CallRuntime(__ phase_zone(), Runtime::kThrowWasmSuspendError, {error},
-                    native_context);
+        __ WasmCallRuntime(__ phase_zone(), Runtime::kThrowWasmSuspendError,
+                           {error}, native_context);
         __ Unreachable();
       }
     }
@@ -1204,8 +1208,8 @@ class WasmWrapperTSGraphBuilder : public WasmGraphBuilderBase {
     IF (has_js_frames) {
       V<Smi> error = __ SmiConstant(Smi::FromInt(
           static_cast<int32_t>(MessageTemplate::kWasmSuspendJSFrames)));
-      CallRuntime(__ phase_zone(), Runtime::kThrowWasmSuspendError, {error},
-                  native_context);
+      __ WasmCallRuntime(__ phase_zone(), Runtime::kThrowWasmSuspendError,
+                         {error}, native_context);
       __ Unreachable();
     }
     V<Object> on_fulfilled = __ Load(suspender, LoadOp::Kind::TaggedBase(),
@@ -1314,7 +1318,7 @@ void BuildWasmWrapper(compiler::turboshaft::PipelineData* data,
   WasmGraphBuilderBase::Assembler assembler(data, graph, graph, &zone);
   WasmWrapperTSGraphBuilder builder(&zone, assembler, sig);
   if (wrapper_info.code_kind == CodeKind::JS_TO_WASM_FUNCTION) {
-    builder.BuildJSToWasmWrapper();
+    builder.BuildJSToWasmWrapper(wrapper_info.receiver_is_first_param);
   } else if (wrapper_info.code_kind == CodeKind::WASM_TO_JS_FUNCTION) {
     builder.BuildWasmToJSWrapper(wrapper_info.import_kind,
                                  wrapper_info.expected_arity,

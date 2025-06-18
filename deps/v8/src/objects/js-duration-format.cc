@@ -19,7 +19,7 @@
 #include "src/objects/intl-objects.h"
 #include "src/objects/js-duration-format-inl.h"
 #include "src/objects/js-number-format.h"
-#include "src/objects/js-temporal-objects.h"
+#include "src/objects/js-temporal-helpers.h"
 #include "src/objects/managed-inl.h"
 #include "src/objects/objects-inl.h"
 #include "src/objects/option-utils.h"
@@ -59,12 +59,14 @@ struct DurationUnitOptions {
   JSDurationFormat::Display display;
 };
 
-const std::initializer_list<const char*> kLongShortNarrowStrings = {
-    "long", "short", "narrow"};
-const std::initializer_list<const char*> kLongShortNarrowNumericStrings = {
-    "long", "short", "narrow", "numeric"};
-const std::initializer_list<const char*> kLongShortNarrowNumeric2DigitStrings =
-    {"long", "short", "narrow", "numeric", "2-digit"};
+const auto kLongShortNarrowStrings =
+    std::to_array<const std::string_view>({"long", "short", "narrow"});
+const auto kLongShortNarrowNumericStrings =
+    std::to_array<const std::string_view>(
+        {"long", "short", "narrow", "numeric"});
+const auto kLongShortNarrowNumeric2DigitStrings =
+    std::to_array<const std::string_view>(
+        {"long", "short", "narrow", "numeric", "2-digit"});
 
 const std::initializer_list<JSDurationFormat::FieldStyle>
     kLongShortNarrowEnums = {JSDurationFormat::FieldStyle::kLong,
@@ -87,8 +89,8 @@ Maybe<DurationUnitOptions> GetDurationUnitOptions(
     Isolate* isolate, Unit unit, const char* unit_string,
     const char* display_field, DirectHandle<JSReceiver> options,
     JSDurationFormat::Style base_style,
-    const std::vector<const char*>& value_strings,
-    const std::vector<JSDurationFormat::FieldStyle>& value_enums,
+    const std::span<const std::string_view> value_strings,
+    const std::span<const JSDurationFormat::FieldStyle> value_enums,
     JSDurationFormat::FieldStyle digital_base,
     JSDurationFormat::FieldStyle prev_style) {
   const char* method_name = "Intl.DurationFormat";
@@ -170,9 +172,10 @@ Maybe<DurationUnitOptions> GetDurationUnitOptions(
   MAYBE_ASSIGN_RETURN_ON_EXCEPTION_VALUE(
       isolate, display,
       GetStringOption<JSDurationFormat::Display>(
-          isolate, options, display_field, method_name, {"auto", "always"},
-          {JSDurationFormat::Display::kAuto,
-           JSDurationFormat::Display::kAlways},
+          isolate, options, display_field, method_name,
+          std::to_array<const std::string_view>({"auto", "always"}),
+          std::array{JSDurationFormat::Display::kAuto,
+                     JSDurationFormat::Display::kAlways},
           display_default),
       Nothing<DurationUnitOptions>());
   // 7. If display is "always" and style is "fractional", then
@@ -276,12 +279,12 @@ MaybeDirectHandle<JSDurationFormat> JSDurationFormat::New(
   // nonterminal, throw a RangeError exception.
   // Note: The matching test and throw in Step 7-a is throw inside
   // Intl::GetNumberingSystem.
-  std::unique_ptr<char[]> numbering_system_str = nullptr;
+  std::string numbering_system_str;
   bool get;
   MAYBE_ASSIGN_RETURN_ON_EXCEPTION_VALUE(
       isolate, get,
       Intl::GetNumberingSystem(isolate, options, method_name,
-                               &numbering_system_str),
+                               numbering_system_str),
       DirectHandle<JSDurationFormat>());
 
   // 8. Let opt be the Record { [[localeMatcher]]: matcher, [[nu]]:
@@ -289,31 +292,29 @@ MaybeDirectHandle<JSDurationFormat> JSDurationFormat::New(
   // 9. Let r be ResolveLocale(%DurationFormat%.[[AvailableLocales]],
   // requestedLocales, opt, %DurationFormat%.[[RelevantExtensionKeys]],
   // %DurationFormat%.[[LocaleData]]).
-  std::set<std::string> relevant_extension_keys{"nu"};
   Intl::ResolvedLocale r;
-  MAYBE_ASSIGN_RETURN_ON_EXCEPTION_VALUE(
-      isolate, r,
-      Intl::ResolveLocale(isolate, JSDurationFormat::GetAvailableLocales(),
-                          requested_locales, matcher, relevant_extension_keys),
-      DirectHandle<JSDurationFormat>());
+  if (!Intl::ResolveLocale(isolate, JSDurationFormat::GetAvailableLocales(),
+                           requested_locales, matcher, {"nu"})
+           .To(&r)) {
+    THROW_NEW_ERROR(isolate, NewRangeError(MessageTemplate::kIcuError));
+  }
 
   // 10. Let locale be r.[[locale]].
   icu::Locale r_locale = r.icu_locale;
   UErrorCode status = U_ZERO_ERROR;
   // 11. Set durationFormat.[[Locale]] to locale.
   // 12. Set durationFormat.[[NumberingSystem]] to r.[[nu]].
-  if (numbering_system_str != nullptr) {
+  if (get) {
     auto nu_extension_it = r.extensions.find("nu");
     if (nu_extension_it != r.extensions.end() &&
-        nu_extension_it->second != numbering_system_str.get()) {
+        nu_extension_it->second != numbering_system_str) {
       r_locale.setUnicodeKeywordValue("nu", nullptr, status);
       DCHECK(U_SUCCESS(status));
     }
   }
   icu::Locale icu_locale = r_locale;
-  if (numbering_system_str != nullptr &&
-      Intl::IsValidNumberingSystem(numbering_system_str.get())) {
-    r_locale.setUnicodeKeywordValue("nu", numbering_system_str.get(), status);
+  if (get && Intl::IsValidNumberingSystem(numbering_system_str)) {
+    r_locale.setUnicodeKeywordValue("nu", numbering_system_str, status);
     DCHECK(U_SUCCESS(status));
   }
   std::string numbering_system = Intl::GetNumberingSystem(r_locale);
@@ -324,11 +325,12 @@ MaybeDirectHandle<JSDurationFormat> JSDurationFormat::New(
   Style style;
   MAYBE_ASSIGN_RETURN_ON_EXCEPTION_VALUE(
       isolate, style,
-      GetStringOption<Style>(
-          isolate, options, "style", method_name,
-          {"long", "short", "narrow", "digital"},
-          {Style::kLong, Style::kShort, Style::kNarrow, Style::kDigital},
-          Style::kShort),
+      GetStringOption<Style>(isolate, options, "style", method_name,
+                             std::to_array<const std::string_view>(
+                                 {"long", "short", "narrow", "digital"}),
+                             std::array{Style::kLong, Style::kShort,
+                                        Style::kNarrow, Style::kDigital},
+                             Style::kShort),
       DirectHandle<JSDurationFormat>());
 
   // 14. Set durationFormat.[[Style]] to style.

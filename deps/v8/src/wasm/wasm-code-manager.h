@@ -28,6 +28,7 @@
 #include "src/tasks/operations-barrier.h"
 #include "src/trap-handler/trap-handler.h"
 #include "src/wasm/compilation-environment.h"
+#include "src/wasm/wasm-code-coverage.h"
 #include "src/wasm/wasm-code-pointer-table.h"
 #include "src/wasm/wasm-features.h"
 #include "src/wasm/wasm-limits.h"
@@ -601,6 +602,15 @@ class WasmCodeAllocator {
 
 class V8_EXPORT_PRIVATE NativeModule final {
  public:
+  class V8_NODISCARD NativeModuleAllocationLockScope {
+   public:
+    explicit NativeModuleAllocationLockScope(NativeModule* module)
+        : lock_(module->allocation_mutex_) {}
+
+   private:
+    base::RecursiveMutexGuard lock_;
+  };
+
   static constexpr ExternalPointerTag kManagedTag = kWasmNativeModuleTag;
 
 #if V8_TARGET_ARCH_X64 || V8_TARGET_ARCH_S390X || V8_TARGET_ARCH_ARM64 || \
@@ -614,6 +624,14 @@ class V8_EXPORT_PRIVATE NativeModule final {
   NativeModule(const NativeModule&) = delete;
   NativeModule& operator=(const NativeModule&) = delete;
   ~NativeModule();
+
+  // Returns the number of lines generated in the disassembly of the whole
+  // module.
+  // {bytecode_disasm_offsets} maps the bytecode offset of a Wasm instruction
+  // into the corresponding line in the disassembler text output.
+  uint32_t DisassembleForLcov(
+      std::ostream& out, std::vector<int>& function_body_offsets,
+      std::map<uint32_t, uint32_t>& bytecode_disasm_offsets);
 
   // {AddCode} is thread safe w.r.t. other calls to {AddCode} or methods adding
   // code below, i.e. it can be called concurrently from background threads.
@@ -839,10 +857,9 @@ class V8_EXPORT_PRIVATE NativeModule final {
     kRemoveTurbofanCode,
     kRemoveAllCode,
   };
-  // Remove all compiled code based on the `filter` from the {NativeModule},
-  // replace it with {CompileLazy} builtins and return the sizes of the removed
-  // (executable) code and the removed metadata.
-  std::pair<size_t, size_t> RemoveCompiledCode(RemoveFilter filter);
+  // Remove all compiled code based on the `filter` from the {NativeModule} and
+  // replace it with {CompileLazy} builtins.
+  void RemoveCompiledCode(RemoveFilter filter);
 
   // Returns the code size of all Liftoff compiled functions.
   size_t SumLiftoffCodeSizeForTesting() const;
@@ -941,6 +958,10 @@ class V8_EXPORT_PRIVATE NativeModule final {
   }
 
   WasmCodePointer GetCodePointerHandle(int index) const;
+
+  const std::shared_ptr<WasmModuleCoverageData>& coverage_data() const {
+    return coverage_data_;
+  }
 
  private:
   friend class WasmCode;
@@ -1142,6 +1163,8 @@ class V8_EXPORT_PRIVATE NativeModule final {
 
   std::unique_ptr<std::atomic<Address>[]> fast_api_targets_;
   std::unique_ptr<std::atomic<const MachineSignature*>[]> fast_api_signatures_;
+
+  std::shared_ptr<WasmModuleCoverageData> coverage_data_;
 };
 
 class V8_EXPORT_PRIVATE WasmCodeManager final {

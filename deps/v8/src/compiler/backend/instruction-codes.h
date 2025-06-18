@@ -74,6 +74,7 @@ inline RecordWriteMode WriteBarrierKindToRecordWriteMode(
   V(AtomicExchangeInt16)                                   \
   V(AtomicExchangeUint16)                                  \
   V(AtomicExchangeWord32)                                  \
+  V(AtomicExchangeWithWriteBarrier)                        \
   V(AtomicCompareExchangeInt8)                             \
   V(AtomicCompareExchangeUint8)                            \
   V(AtomicCompareExchangeInt16)                            \
@@ -132,14 +133,13 @@ inline RecordWriteMode WriteBarrierKindToRecordWriteMode(
   V(ArchCallJSFunction)                                                    \
   IF_WASM(V, ArchCallWasmFunction)                                         \
   IF_WASM(V, ArchCallWasmFunctionIndirect)                                 \
+  V(ArchCallCFunction)                                                     \
   V(ArchCallBuiltinPointer)                                                \
   /* Update IsCallWithDescriptorFlags if further Call opcodes are added */ \
                                                                            \
   V(ArchPrepareCallCFunction)                                              \
   V(ArchSaveCallerRegisters)                                               \
   V(ArchRestoreCallerRegisters)                                            \
-  V(ArchCallCFunction)                                                     \
-  V(ArchCallCFunctionWithFrameState)                                       \
   V(ArchPrepareTailCall)                                                   \
   V(ArchJmp)                                                               \
   V(ArchBinarySearchSwitch)                                                \
@@ -148,7 +148,6 @@ inline RecordWriteMode WriteBarrierKindToRecordWriteMode(
   V(ArchAbortCSADcheck)                                                    \
   V(ArchDebugBreak)                                                        \
   V(ArchComment)                                                           \
-  V(ArchThrowTerminator)                                                   \
   V(ArchDeoptimize)                                                        \
   V(ArchRet)                                                               \
   V(ArchFramePointer)                                                      \
@@ -354,11 +353,6 @@ using InstructionCode = uint32_t;
 // StackCheck                   | 2
 // BranchHint                   | 1
 // Undefined                    | 7
-//
-// -- C calls
-// Field                        | Bits
-// Param                        | 5
-// FPParam                      | 5
 //
 using ArchOpcodeField = base::BitField<ArchOpcode, 0, 9>;
 static_assert(ArchOpcodeField::is_valid(kLastArchOpcode),

@@ -26,6 +26,8 @@ include_rules = [
   "+src/heap/factory-inl.h",
   # TODO(v8:10496): Don't expose so much (through transitive includes) outside
   # of heap/.
+  "+src/heap/gc-callbacks.h",
+  "+src/heap/gc-callbacks-inl.h",
   "+src/heap/gc-tracer.h",
   "+src/heap/gc-tracer-inl.h",
   "+src/heap/heap.h",
@@ -131,5 +133,8 @@ specific_include_rules = {
   ],
   "string-hasher-inl\.h": [
     "+third_party/rapidhash-v8/rapidhash.h",
-  ]
+  ],
+  "json-stringifier.cc": [
+    "+absl/functional/overload.h",
+  ],
 }

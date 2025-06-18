@@ -172,12 +172,10 @@ inline ReduceResult MaybeReduceResult::Checked() { return ReduceResult(*this); }
 
 enum class UseReprHintRecording { kRecord, kDoNotRecord };
 
-NodeType StaticTypeForNode(compiler::JSHeapBroker* broker,
-                           LocalIsolate* isolate, ValueNode* node);
-
 struct CatchBlockDetails {
   BasicBlockRef* ref = nullptr;
   bool exception_handler_was_used = false;
+  bool block_already_exists = false;
   int deopt_frame_distance = 0;
 };
 
@@ -319,79 +317,41 @@ class MaglevGraphBuilder {
   }
 
   SmiConstant* GetSmiConstant(int constant) const {
-    DCHECK(Smi::IsValid(constant));
-    auto it = graph_->smi().find(constant);
-    if (it == graph_->smi().end()) {
-      SmiConstant* node =
-          CreateNewConstantNode<SmiConstant>(0, Smi::FromInt(constant));
-      graph_->smi().emplace(constant, node);
-      return node;
-    }
-    return it->second;
+    return graph()->GetSmiConstant(constant);
   }
-
   TaggedIndexConstant* GetTaggedIndexConstant(int constant) {
-    DCHECK(TaggedIndex::IsValid(constant));
-    auto it = graph_->tagged_index().find(constant);
-    if (it == graph_->tagged_index().end()) {
-      TaggedIndexConstant* node = CreateNewConstantNode<TaggedIndexConstant>(
-          0, TaggedIndex::FromIntptr(constant));
-      graph_->tagged_index().emplace(constant, node);
-      return node;
-    }
-    return it->second;
+    return graph()->GetTaggedIndexConstant(constant);
   }
-
   Int32Constant* GetInt32Constant(int32_t constant) {
-    auto it = graph_->int32().find(constant);
-    if (it == graph_->int32().end()) {
-      Int32Constant* node = CreateNewConstantNode<Int32Constant>(0, constant);
-      graph_->int32().emplace(constant, node);
-      return node;
-    }
-    return it->second;
+    return graph()->GetInt32Constant(constant);
   }
-
   IntPtrConstant* GetIntPtrConstant(intptr_t constant) {
-    auto it = graph_->intptr().find(constant);
-    if (it == graph_->intptr().end()) {
-      IntPtrConstant* node = CreateNewConstantNode<IntPtrConstant>(0, constant);
-      graph_->intptr().emplace(constant, node);
-      return node;
-    }
-    return it->second;
+    return graph()->GetIntPtrConstant(constant);
   }
-
   Uint32Constant* GetUint32Constant(int constant) {
-    auto it = graph_->uint32().find(constant);
-    if (it == graph_->uint32().end()) {
-      Uint32Constant* node = CreateNewConstantNode<Uint32Constant>(0, constant);
-      graph_->uint32().emplace(constant, node);
-      return node;
-    }
-    return it->second;
+    return graph()->GetUint32Constant(constant);
   }
-
   Float64Constant* GetFloat64Constant(double constant) {
-    return GetFloat64Constant(
-        Float64::FromBits(base::double_to_uint64(constant)));
+    return graph()->GetFloat64Constant(constant);
   }
-
   Float64Constant* GetFloat64Constant(Float64 constant) {
-    auto it = graph_->float64().find(constant.get_bits());
-    if (it == graph_->float64().end()) {
-      Float64Constant* node =
-          CreateNewConstantNode<Float64Constant>(0, constant);
-      graph_->float64().emplace(constant.get_bits(), node);
-      return node;
-    }
-    return it->second;
+    return graph()->GetFloat64Constant(constant);
+  }
+  RootConstant* GetRootConstant(RootIndex index) {
+    return graph()->GetRootConstant(index);
+  }
+  RootConstant* GetBooleanConstant(bool value) {
+    return graph()->GetBooleanConstant(value);
+  }
+  ValueNode* GetConstant(compiler::ObjectRef ref) {
+    return graph()->GetConstant(ref);
+  }
+  ValueNode* GetTrustedConstant(compiler::HeapObjectRef ref,
+                                IndirectPointerTag tag) {
+    return graph()->GetTrustedConstant(ref, tag);
   }
 
   ValueNode* GetNumberConstant(double constant);
-
-  static compiler::OptionalHeapObjectRef TryGetConstant(
-      compiler::JSHeapBroker* broker, LocalIsolate* isolate, ValueNode* node);
 
   Graph* graph() const { return graph_; }
   Zone* zone() const { return compilation_unit_->zone(); }
@@ -406,11 +366,10 @@ class MaglevGraphBuilder {
   compiler::JSHeapBroker* broker() const { return broker_; }
   LocalIsolate* local_isolate() const { return local_isolate_; }
 
-  bool has_graph_labeller() const {
-    return compilation_unit_->has_graph_labeller();
-  }
+  bool has_graph_labeller() const { return graph_->has_graph_labeller(); }
   MaglevGraphLabeller* graph_labeller() const {
-    return compilation_unit_->graph_labeller();
+    if (graph_->has_graph_labeller()) return graph_->graph_labeller();
+    return nullptr;
   }
 
   // True when this graph builder is building the subgraph of an inlined
@@ -494,6 +453,16 @@ class MaglevGraphBuilder {
       return v8_flags.max_maglev_inlined_bytecode_size_cumulative;
     }
   }
+  int max_inline_depth() {
+    if (is_turbolev()) {
+      // This is just to avoid some corner cases, especially since we allow
+      // recursive inlining.
+      constexpr int kMaxDepthForInlining = 50;
+      return kMaxDepthForInlining;
+    } else {
+      return v8_flags.max_maglev_inline_depth;
+    }
+  }
 
   DeoptFrame* AddInlinedArgumentsToDeoptFrame(DeoptFrame* deopt_frame,
                                               const MaglevCompilationUnit* unit,
@@ -556,24 +525,34 @@ class MaglevGraphBuilder {
   class CallSpeculationScope;
   class SaveCallSpeculationScope;
 
-  bool CheckStaticType(ValueNode* node, NodeType type, NodeType* old = nullptr);
-  bool CheckType(ValueNode* node, NodeType type, NodeType* old = nullptr);
-  NodeType CheckTypes(ValueNode* node, std::initializer_list<NodeType> types);
-  bool EnsureType(ValueNode* node, NodeType type, NodeType* old = nullptr);
-  NodeType GetType(ValueNode* node);
-  NodeInfo* GetOrCreateInfoFor(ValueNode* node) {
-    return known_node_aspects().GetOrCreateInfoFor(node, broker(),
-                                                   local_isolate());
+  bool CheckType(ValueNode* node, NodeType type, NodeType* old = nullptr) {
+    return known_node_aspects().CheckType(broker(), node, type, old);
   }
-
+  NodeType CheckTypes(ValueNode* node, std::initializer_list<NodeType> types) {
+    return known_node_aspects().CheckTypes(broker(), node, types);
+  }
+  bool EnsureType(ValueNode* node, NodeType type, NodeType* old = nullptr) {
+    return known_node_aspects().EnsureType(broker(), node, type, old);
+  }
+  template <typename Function>
+  bool EnsureType(ValueNode* node, NodeType type, Function ensure_new_type) {
+    return known_node_aspects().EnsureType<Function>(broker(), node, type,
+                                                     ensure_new_type);
+  }
+  NodeType GetType(ValueNode* node) {
+    return known_node_aspects().GetType(broker(), node);
+  }
+  NodeInfo* GetOrCreateInfoFor(ValueNode* node) {
+    return known_node_aspects().GetOrCreateInfoFor(broker(), node);
+  }
   // Returns true if we statically know that {lhs} and {rhs} have disjoint
   // types.
-  bool HaveDisjointTypes(ValueNode* lhs, ValueNode* rhs);
-  bool HasDisjointType(ValueNode* lhs, NodeType rhs_type);
-
-  template <typename Function>
-  bool EnsureType(ValueNode* node, NodeType type, Function ensure_new_type);
-  bool MayBeNullOrUndefined(ValueNode* node);
+  bool HaveDisjointTypes(ValueNode* lhs, ValueNode* rhs) {
+    return known_node_aspects().HaveDisjointTypes(broker(), lhs, rhs);
+  }
+  bool HasDisjointType(ValueNode* lhs, NodeType rhs_type) {
+    return known_node_aspects().HasDisjointType(broker(), lhs, rhs_type);
+  }
 
   void SetKnownValue(ValueNode* node, compiler::ObjectRef constant,
                      NodeType new_node_type);
@@ -742,6 +721,11 @@ class MaglevGraphBuilder {
     return merge_states_[offset] != nullptr;
   }
 
+  bool IsOffsetAMergePointOrLoopHeapder(int offset) {
+    return IsOffsetAMergePoint(offset) ||
+           bytecode_analysis().IsLoopHeader(offset);
+  }
+
   ValueNode* GetContextAtDepth(ValueNode* context, size_t depth);
   bool CheckContextExtensions(size_t depth);
 
@@ -842,8 +826,7 @@ class MaglevGraphBuilder {
   void PrintVirtualObjects() {
     if (!v8_flags.trace_maglev_graph_building) return;
     current_interpreter_frame_.virtual_objects().Print(
-        std::cout, "* VOs (Interpreter Frame State): ",
-        compilation_unit()->graph_labeller());
+        std::cout, "* VOs (Interpreter Frame State): ", graph_labeller());
   }
 
   void VisitSingleBytecode() {
@@ -1035,12 +1018,10 @@ class MaglevGraphBuilder {
     static constexpr Opcode op = Node::opcode_of<NodeT>;
     static_assert(Node::participate_in_cse(op));
     using options_result =
-        typename std::invoke_result<decltype(&NodeT::options),
-                                    const NodeT>::type;
-    static_assert(
-        std::is_assignable<options_result, std::tuple<Args...>>::value,
-        "Instruction participating in CSE needs options() returning "
-        "a tuple matching the constructor arguments");
+        std::invoke_result_t<decltype(&NodeT::options), const NodeT>;
+    static_assert(std::is_assignable_v<options_result, std::tuple<Args...>>,
+                  "Instruction participating in CSE needs options() returning "
+                  "a tuple matching the constructor arguments");
     static_assert(IsFixedInputNode<NodeT>());
     static_assert(NodeT::kInputCount <= 3);
 
@@ -1232,7 +1213,8 @@ class MaglevGraphBuilder {
         }
 
         DCHECK_IMPLIES(!IsInsideTryBlock(), is_inline());
-        if (!IsInsideTryBlock() && !is_eager_inline()) {
+        if (catch_block.block_already_exists) {
+          DCHECK(!IsInsideTryBlock());
           // If we are inlining a function non-eagerly and we are not inside a
           // try block, then the catch block already exists.
           new (node->exception_handler_info()) ExceptionHandlerInfo(
@@ -1288,7 +1270,7 @@ class MaglevGraphBuilder {
       // Inside a try-block.
       int offset = catch_block_stack_.top().handler;
       return {&jump_targets_[offset],
-              merge_states_[offset]->exception_handler_was_used(), 0};
+              merge_states_[offset]->exception_handler_was_used(), false, 0};
     }
     if (!is_inline()) {
       return CatchBlockDetails{};
@@ -1296,14 +1278,20 @@ class MaglevGraphBuilder {
     return caller_details_->catch_block;
   }
 
-  CatchBlockDetails GetTryCatchBlockFromInfo(ExceptionHandlerInfo* info) {
+  CatchBlockDetails GetTryCatchBlockForNonEagerInlining(
+      ExceptionHandlerInfo* info) {
     if (IsInsideTryBlock()) {
-      return {info->catch_block_ref_address(), !info->ShouldLazyDeopt(), 0};
+      return {info->catch_block_ref_address(), !info->ShouldLazyDeopt(), true,
+              0};
     }
     if (!is_inline()) {
       return CatchBlockDetails{};
     }
-    return caller_details_->catch_block;
+    // Since this CatchBlockDetails is stored in a non-eager call site,
+    // the catch block will already exist by the time inlining is attempted.
+    CatchBlockDetails catch_details = caller_details_->catch_block;
+    catch_details.block_already_exists = true;
+    return catch_details;
   }
 
   bool ContextMayAlias(ValueNode* context,
@@ -1447,7 +1435,7 @@ class MaglevGraphBuilder {
     Handle<String> string_handle =
         local_isolate()->factory()->NewStringFromAsciiChecked(
             str, AllocationType::kOld);
-    ValueNode* string_node = GetConstant(MakeRefAssumeMemoryFence(
+    ValueNode* string_node = graph()->GetConstant(MakeRefAssumeMemoryFence(
         broker(), broker()->CanonicalPersistentHandle(string_handle)));
     CHECK(BuildCallRuntime(Runtime::kGlobalPrint, {string_node}).IsDone());
   }
@@ -1462,7 +1450,7 @@ class MaglevGraphBuilder {
   }
 
   ValueNode* GetFeedbackCell() {
-    return GetConstant(
+    return graph()->GetConstant(
         compilation_unit_->GetTopLevelCompilationUnit()->feedback_cell());
   }
 
@@ -1505,36 +1493,7 @@ class MaglevGraphBuilder {
                           operand_index, local_isolate()))));
   }
 
-  ExternalConstant* GetExternalConstant(ExternalReference reference) {
-    auto it = graph_->external_references().find(reference.address());
-    if (it == graph_->external_references().end()) {
-      ExternalConstant* node =
-          CreateNewConstantNode<ExternalConstant>(0, reference);
-      graph_->external_references().emplace(reference.address(), node);
-      return node;
-    }
-    return it->second;
-  }
-
-  RootConstant* GetRootConstant(RootIndex index) {
-    auto it = graph_->root().find(index);
-    if (it == graph_->root().end()) {
-      RootConstant* node = CreateNewConstantNode<RootConstant>(0, index);
-      graph_->root().emplace(index, node);
-      return node;
-    }
-    return it->second;
-  }
-
-  RootConstant* GetBooleanConstant(bool value) {
-    return GetRootConstant(value ? RootIndex::kTrueValue
-                                 : RootIndex::kFalseValue);
-  }
-
-  ValueNode* GetConstant(compiler::ObjectRef ref);
-
-  ValueNode* GetTrustedConstant(compiler::HeapObjectRef ref,
-                                IndirectPointerTag tag);
+  MaybeReduceResult GetConstantSingleCharacterStringFromCode(uint16_t);
 
   ValueNode* GetRegisterInput(Register reg) {
     DCHECK(!graph_->register_inputs().has(reg));
@@ -1637,6 +1596,10 @@ class MaglevGraphBuilder {
   std::optional<double> TryGetFloat64Constant(
       ValueNode* value, TaggedToFloat64ConversionType conversion_type);
 
+#ifdef V8_ENABLE_EXPERIMENTAL_UNDEFINED_DOUBLE
+  std::optional<double> TryGetHoleyFloat64Constant(ValueNode* value);
+#endif  // V8_ENABLE_EXPERIMENTAL_UNDEFINED_DOUBLE
+
   // Get a Float64 representation node whose value is equivalent to the given
   // node.
   //
@@ -1646,6 +1609,8 @@ class MaglevGraphBuilder {
   ValueNode* GetFloat64(interpreter::Register reg) {
     return GetFloat64(current_interpreter_frame_.get(reg));
   }
+
+  ValueNode* GetHoleyFloat64(ValueNode* value, bool convert_hole_to_undefined);
 
   // Get a Float64 representation node whose value is the result of ToNumber on
   // the given node. Only trivial ToNumber is allowed -- values that are already
@@ -1766,7 +1731,7 @@ class MaglevGraphBuilder {
     DCHECK(interpreter::Bytecodes::ClobbersAccumulator(
         iterator_.current_bytecode()));
     current_interpreter_frame_.set_accumulator(
-        GetRootConstant(RootIndex::kOptimizedOut));
+        graph()->GetRootConstant(RootIndex::kOptimizedOut));
   }
 
   ValueNode* GetSecondValue(ValueNode* result) {
@@ -2098,6 +2063,10 @@ class MaglevGraphBuilder {
                                           ExternalArrayType type,
                                           Function&& getValue);
 
+  MaybeReduceResult TryReduceDatePrototypeGetField(
+      compiler::JSFunctionRef target, CallArguments& args,
+      JSDate::FieldIndex field);
+
 #ifdef V8_ENABLE_CONTINUATION_PRESERVED_EMBEDDER_DATA
 #define CONTINUATION_PRESERVED_EMBEDDER_DATA_LIST(V) \
   V(GetContinuationPreservedEmbedderData)            \
@@ -2125,6 +2094,13 @@ class MaglevGraphBuilder {
   V(DataViewPrototypeSetInt32)                 \
   V(DataViewPrototypeGetFloat64)               \
   V(DataViewPrototypeSetFloat64)               \
+  V(DatePrototypeGetFullYear)                  \
+  V(DatePrototypeGetMonth)                     \
+  V(DatePrototypeGetDate)                      \
+  V(DatePrototypeGetDay)                       \
+  V(DatePrototypeGetHours)                     \
+  V(DatePrototypeGetMinutes)                   \
+  V(DatePrototypeGetSeconds)                   \
   V(FunctionPrototypeApply)                    \
   V(FunctionPrototypeCall)                     \
   V(FunctionPrototypeHasInstance)              \
@@ -2139,9 +2115,11 @@ class MaglevGraphBuilder {
   V(MathPow)                                   \
   V(MathAbs)                                   \
   V(MathRound)                                 \
+  V(MathClz32)                                 \
   V(SetPrototypeHas)                           \
   V(StringConstructor)                         \
   V(StringFromCharCode)                        \
+  V(StringPrototypeCharAt)                     \
   V(StringPrototypeCharCodeAt)                 \
   V(StringPrototypeCodePointAt)                \
   V(StringPrototypeIterator)                   \
@@ -2172,6 +2150,14 @@ class MaglevGraphBuilder {
       const std::optional<InitialCallback>& initial_callback = {},
       const std::optional<ProcessElementCallback>& process_element_callback =
           {});
+
+  // OOB StringAt access behaves differently for elements (needs the elements
+  // protector, positive indices, and returns undefined) and charAt (allows
+  // negative indices, returns empty string).
+  enum class StringAtOOBMode { kElement, kCharAt };
+  MaybeReduceResult TryReduceConstantStringAt(ValueNode* object,
+                                              ValueNode* index,
+                                              StringAtOOBMode oob_mode);
 
   MaybeReduceResult TryReduceGetProto(ValueNode* node);
 
@@ -2356,15 +2342,19 @@ class MaglevGraphBuilder {
   ReduceResult BuildCheckSmi(ValueNode* object, bool elidable = true);
   ReduceResult BuildCheckNumber(ValueNode* object);
   ReduceResult BuildCheckHeapObject(ValueNode* object);
+  ReduceResult BuildCheckJSFunction(ValueNode* object);
   ReduceResult BuildCheckJSReceiver(ValueNode* object);
   ReduceResult BuildCheckJSReceiverOrNullOrUndefined(ValueNode* object);
+  ReduceResult BuildCheckSeqOneByteString(ValueNode* object);
   ReduceResult BuildCheckString(ValueNode* object);
   ReduceResult BuildCheckStringOrStringWrapper(ValueNode* object);
+  ReduceResult BuildCheckStringOrOddball(ValueNode* object);
   ReduceResult BuildCheckSymbol(ValueNode* object);
   ReduceResult BuildCheckMaps(
       ValueNode* object, base::Vector<const compiler::MapRef> maps,
       std::optional<ValueNode*> map = {},
-      bool has_deprecated_map_without_migration_target = false);
+      bool has_deprecated_map_without_migration_target = false,
+      bool migration_done_outside = false);
   ReduceResult BuildTransitionElementsKindOrCheckMap(
       ValueNode* heap_object, ValueNode* object_map,
       const ZoneVector<compiler::MapRef>& transition_sources,
@@ -2515,6 +2505,9 @@ class MaglevGraphBuilder {
                                     NodeType length_type = NodeType::kSmi);
   ValueNode* BuildLoadElements(ValueNode* object);
 
+  ValueNode* BuildLoadJSFunctionFeedbackCell(ValueNode* closure);
+  ValueNode* BuildLoadJSFunctionContext(ValueNode* closure);
+
   MaybeReduceResult TryBuildCheckInt32Condition(
       ValueNode* lhs, ValueNode* rhs, AssertCondition condition,
       DeoptimizeReason reason, bool allow_unconditional_deopt = true);
@@ -2562,6 +2555,7 @@ class MaglevGraphBuilder {
 
   MaybeReduceResult TryBuildElementAccessOnString(
       ValueNode* object, ValueNode* index,
+      const compiler::ElementAccessFeedback& access_info,
       compiler::KeyedAccessMode const& keyed_mode);
   MaybeReduceResult TryBuildElementAccessOnTypedArray(
       ValueNode* object, ValueNode* index,
@@ -2598,6 +2592,15 @@ class MaglevGraphBuilder {
       compiler::AccessMode access_mode,
       const ZoneVector<compiler::PropertyAccessInfo>& access_infos,
       GenericAccessFunc&& build_generic_access);
+
+  struct ContinuationOffsets {
+    int last_continuation;
+    int after_continuation;
+  };
+  std::optional<ContinuationOffsets>
+  FindContinuationForPolymorphicPropertyLoad();
+  void BuildContinuationForPolymorphicPropertyLoad(
+      const ContinuationOffsets& offsets);
 
   // Load elimination -- when loading or storing a simple property without
   // side effects, record its value, and allow that value to be reused on
@@ -2808,7 +2811,6 @@ class MaglevGraphBuilder {
   template <Operation kOperation>
   ReduceResult VisitBinarySmiOperation();
 
-  ValueNode* BuildUnwrapThinString(ValueNode* input);
   ValueNode* BuildUnwrapStringWrapper(ValueNode* input);
   ReduceResult BuildStringConcat(ValueNode* left, ValueNode* right);
   ValueNode* BuildNewConsStringMap(ValueNode* left, ValueNode* right);
@@ -3278,6 +3280,8 @@ class MaglevGraphBuilder {
 
   InterpreterFrameState current_interpreter_frame_;
   compiler::FeedbackSource current_speculation_feedback_;
+  SpeculationMode current_speculation_mode_ =
+      SpeculationMode::kDisallowSpeculation;
 
   ValueNode* inlined_new_target_ = nullptr;
 
@@ -3361,7 +3365,14 @@ class MaglevGraphBuilder {
   }
 
   bool CanSpeculateCall() const {
-    return current_speculation_feedback_.IsValid();
+    return current_speculation_mode_ == SpeculationMode::kAllowSpeculation;
+  }
+
+  bool CanSpeculateCall(
+      std::initializer_list<SpeculationMode> supported_modes) const {
+    return CanSpeculateCall() ||
+           std::find(supported_modes.begin(), supported_modes.end(),
+                     current_speculation_mode_) != supported_modes.end();
   }
 
   inline void MarkNodeDead(Node* node) {

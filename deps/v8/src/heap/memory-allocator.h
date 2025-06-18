@@ -58,11 +58,6 @@ class MemoryAllocator {
     // Frees page immediately on the main thread.
     kImmediately,
 
-    // Postpone freeing, until MemoryAllocator::ReleaseQueuedPages() is called.
-    // This is used in the major GC to allow the pointer-update phase to touch
-    // dead memory.
-    kPostpone,
-
     // Pool page.
     kPool,
   };
@@ -95,7 +90,8 @@ class MemoryAllocator {
       Executability executable);
 
   V8_EXPORT_PRIVATE LargePageMetadata* AllocateLargePage(
-      LargeObjectSpace* space, size_t object_size, Executability executable);
+      LargeObjectSpace* space, size_t object_size, Executability executable,
+      AllocationHint hint);
 
   bool ResizeLargePage(LargePageMetadata* page, size_t old_object_size,
                        size_t new_object_size);
@@ -109,6 +105,7 @@ class MemoryAllocator {
   V8_EXPORT_PRIVATE void Free(MemoryAllocator::FreeMode mode,
                               MutablePageMetadata* chunk);
   void FreeReadOnlyPage(ReadOnlyPageMetadata* chunk);
+  void FreeLargePagesPooled(std::vector<LargePageMetadata*> pages);
 
   // Returns allocated spaces in bytes.
   size_t Size() const { return size_; }
@@ -210,10 +207,6 @@ class MemoryAllocator {
   void RecordMemoryChunkCreated(const MemoryChunk* chunk);
   void RecordMemoryChunkDestroyed(const MemoryChunk* chunk);
 
-  // We postpone page freeing until the pointer-update phase is done (updating
-  // slots may happen for dead objects which point to dead memory).
-  void ReleaseQueuedPages();
-
   // Returns the number of cached chunks for this isolate.
   V8_EXPORT_PRIVATE size_t GetPooledChunksCount();
 
@@ -250,21 +243,24 @@ class MemoryAllocator {
   // the uninitialized memory region.
   V8_WARN_UNUSED_RESULT std::optional<MemoryChunkAllocationResult>
   AllocateUninitializedChunk(BaseSpace* space, size_t area_size,
-                             Executability executable, PageSize page_size) {
+                             Executability executable, PageSize page_size,
+                             AllocationHint hint) {
     return AllocateUninitializedChunkAt(space, area_size, executable,
-                                        kNullAddress, page_size);
+                                        kNullAddress, page_size, hint);
   }
   V8_WARN_UNUSED_RESULT std::optional<MemoryChunkAllocationResult>
   AllocateUninitializedChunkAt(BaseSpace* space, size_t area_size,
                                Executability executable, Address hint,
-                               PageSize page_size);
+                               PageSize page_size,
+                               AllocationHint allocation_hint);
 
   // Internal raw allocation method that allocates an aligned MemoryChunk and
   // sets the right memory permissions.
   Address AllocateAlignedMemory(size_t chunk_size, size_t area_size,
                                 size_t alignment, AllocationSpace space,
                                 Executability executable, void* hint,
-                                VirtualMemory* controller);
+                                VirtualMemory* controller, PageSize page_size,
+                                AllocationHint allocation_hint);
 
   // Sets memory permissions on executable memory chunks. This entails page
   // header (RW), guard pages (no access) and the object area (code modification
@@ -289,6 +285,9 @@ class MemoryAllocator {
   // support pools for NOT_EXECUTABLE pages of size MemoryChunk::kPageSize.
   std::optional<MemoryChunkAllocationResult> AllocateUninitializedPageFromPool(
       Space* space);
+
+  std::optional<MemoryChunkAllocationResult>
+  TryAllocateUninitializedLargePageFromPool(Space* space, size_t chunk_size);
 
   // Initializes pages in a chunk. Returns the first page address.
   // This function and GetChunkId() are provided for the mark-compact
@@ -402,7 +401,6 @@ class MemoryAllocator {
 
   std::optional<VirtualMemory> reserved_chunk_at_virtual_memory_limit_;
   PagePool* pool_;
-  std::vector<MutablePageMetadata*> queued_pages_to_be_freed_;
 
 #ifdef DEBUG
   // Data structure to remember allocated executable memory chunks.

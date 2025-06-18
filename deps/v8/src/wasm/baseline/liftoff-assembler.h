@@ -9,6 +9,7 @@
 #include <memory>
 
 #include "src/base/bits.h"
+#include "src/codegen/atomic-memory-order.h"
 #include "src/codegen/macro-assembler.h"
 #include "src/wasm/baseline/liftoff-assembler-defs.h"
 #include "src/wasm/baseline/liftoff-compiler.h"
@@ -706,6 +707,11 @@ class LiftoffAssembler : public MacroAssembler {
                                 Register offset_reg, int32_t offset_imm,
                                 uint32_t* protected_load_pc = nullptr,
                                 bool offset_reg_needs_shift = false);
+  inline void AtomicLoadTaggedPointer(Register dst, Register src_addr,
+                                      Register offset_reg, int32_t offset_imm,
+                                      AtomicMemoryOrder memory_order,
+                                      uint32_t* protected_load_pc = nullptr,
+                                      bool offset_reg_needs_shift = false);
   inline void LoadProtectedPointer(Register dst, Register src_addr,
                                    int32_t offset);
   inline void LoadFullPointer(Register dst, Register src_addr,
@@ -719,11 +725,18 @@ class LiftoffAssembler : public MacroAssembler {
     kSkipWriteBarrier = true,
     kNoSkipWriteBarrier = false
   };
+  inline void EmitWriteBarrier(Register target_object, Operand store_location,
+                               Register stored_value, LiftoffRegList pinned);
   inline void StoreTaggedPointer(Register dst_addr, Register offset_reg,
                                  int32_t offset_imm, Register src,
                                  LiftoffRegList pinned,
                                  uint32_t* protected_store_pc = nullptr,
                                  SkipWriteBarrier = kNoSkipWriteBarrier);
+  inline void AtomicStoreTaggedPointer(Register dst_addr, Register offset_reg,
+                                       int32_t offset_imm, Register src,
+                                       LiftoffRegList pinned,
+                                       AtomicMemoryOrder memory_order,
+                                       uint32_t* protected_store_pc = nullptr);
   // Warning: may clobber {dst} on some architectures!
   inline void IncrementSmi(LiftoffRegister dst, int offset);
   inline void Load(LiftoffRegister dst, Register src_addr, Register offset_reg,
@@ -772,6 +785,9 @@ class LiftoffAssembler : public MacroAssembler {
                              uintptr_t offset_imm, LiftoffRegister value,
                              LiftoffRegister result, StoreType type,
                              bool i64_offset);
+  inline void AtomicExchangeTaggedPointer(
+      Register dst_addr, Register offset_reg, uintptr_t offset_imm,
+      LiftoffRegister value, LiftoffRegister result, LiftoffRegList pinned);
 
   inline void AtomicCompareExchange(Register dst_addr, Register offset_reg,
                                     uintptr_t offset_imm,
@@ -1514,6 +1530,11 @@ class LiftoffAssembler : public MacroAssembler {
 
   inline void set_trap_on_oob_mem64(Register index, uint64_t max_index,
                                     Label* trap_label);
+
+  // Increment a code coverage counter. Counters are per-NativeModule, not
+  // per-Isolate, and this operation is not atomic, therefore it is possible to
+  // have races.
+  inline void emit_inc_i32_at(Address address);
 
   inline void StackCheck(Label* ool_code);
 

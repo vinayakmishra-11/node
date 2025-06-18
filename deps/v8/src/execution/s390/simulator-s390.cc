@@ -1301,6 +1301,8 @@ void Simulator::EvalTableInit() {
   EvalTable[OGR] = &Simulator::Evaluate_OGR;
   EvalTable[XGR] = &Simulator::Evaluate_XGR;
   EvalTable[FLOGR] = &Simulator::Evaluate_FLOGR;
+  EvalTable[CLZG] = &Simulator::Evaluate_CLZG;
+  EvalTable[CTZG] = &Simulator::Evaluate_CTZG;
   EvalTable[LLGCR] = &Simulator::Evaluate_LLGCR;
   EvalTable[LLGHR] = &Simulator::Evaluate_LLGHR;
   EvalTable[MLGR] = &Simulator::Evaluate_MLGR;
@@ -4580,14 +4582,14 @@ EVALUATE(VFI) {
       DCHECK(CpuFeatures::IsSupported(VECTOR_ENHANCE_FACILITY_1));
       for (int i = 0; i < 4; i++) {
         float value = get_simd_register_by_lane<float>(r2, i);
-        float n = ComputeRounding<float>(value, m5);
+        float n = std::isnan(value) ? NAN : ComputeRounding<float>(value, m5);
         set_simd_register_by_lane<float>(r1, i, n);
       }
       break;
     case 3:
       for (int i = 0; i < 2; i++) {
         double value = get_simd_register_by_lane<double>(r2, i);
-        double n = ComputeRounding<double>(value, m5);
+        double n = std::isnan(value) ? NAN : ComputeRounding<double>(value, m5);
         set_simd_register_by_lane<double>(r1, i, n);
       }
       break;
@@ -7183,7 +7185,12 @@ EVALUATE(AEBR) {
   DECODE_RRE_INSTRUCTION(r1, r2);
   float fr1_val = get_fpr<float>(r1);
   float fr2_val = get_fpr<float>(r2);
-  fr1_val += fr2_val;
+  fr1_val = FPProcessNaNBinop<float, Float32, uint32_t>(
+      fr1_val, fr2_val, [](float lhs, float rhs) {
+        if (std::isinf(lhs) && std::isinf(rhs) && (lhs != rhs))
+          return std::numeric_limits<float>::quiet_NaN();
+        return lhs + rhs;
+      });
   set_fpr(r1, fr1_val);
   SetS390ConditionCode<float>(fr1_val, 0);
 
@@ -7195,7 +7202,12 @@ EVALUATE(SEBR) {
   DECODE_RRE_INSTRUCTION(r1, r2);
   float fr1_val = get_fpr<float>(r1);
   float fr2_val = get_fpr<float>(r2);
-  fr1_val -= fr2_val;
+  fr1_val = FPProcessNaNBinop<float, Float32, uint32_t>(
+      fr1_val, fr2_val, [](float lhs, float rhs) {
+        if (std::isinf(lhs) && std::isinf(rhs) && (lhs == rhs))
+          return std::numeric_limits<float>::quiet_NaN();
+        return lhs - rhs;
+      });
   set_fpr(r1, fr1_val);
   SetS390ConditionCode<float>(fr1_val, 0);
 
@@ -7312,7 +7324,8 @@ EVALUATE(MEEBR) {
   DECODE_RRE_INSTRUCTION(r1, r2);
   float fr1_val = get_fpr<float>(r1);
   float fr2_val = get_fpr<float>(r2);
-  fr1_val *= fr2_val;
+  fr1_val = FPProcessNaNBinop<float, Float32, uint32_t>(
+      fr1_val, fr2_val, [](float lhs, float rhs) { return lhs * rhs; });
   set_fpr(r1, fr1_val);
   return length;
 }
@@ -8668,6 +8681,20 @@ EVALUATE(FLOGR) {
   int64_t mask = ~(1 << (63 - i));
   set_register(r1, i);
   set_register(r1 + 1, r2_val & mask);
+  return length;
+}
+
+EVALUATE(CLZG) {
+  DCHECK_OPCODE(CLZG);
+  DECODE_RRE_INSTRUCTION(r1, r2);
+  set_register(r1, base::bits::CountLeadingZeros64(get_register(r2)));
+  return length;
+}
+
+EVALUATE(CTZG) {
+  DCHECK_OPCODE(CTZG);
+  DECODE_RRE_INSTRUCTION(r1, r2);
+  set_register(r1, base::bits::CountTrailingZeros64(get_register(r2)));
   return length;
 }
 

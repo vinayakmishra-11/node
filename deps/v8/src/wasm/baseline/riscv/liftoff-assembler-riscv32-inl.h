@@ -232,6 +232,16 @@ void LiftoffAssembler::LoadTaggedPointer(Register dst, Register src_addr,
        false, false, needs_shift);
 }
 
+void LiftoffAssembler::AtomicLoadTaggedPointer(Register dst, Register src_addr,
+                                               Register offset_reg,
+                                               int32_t offset_imm,
+                                               AtomicMemoryOrder memory_order,
+                                               uint32_t* protected_load_pc,
+                                               bool needs_shift) {
+  LoadTaggedPointer(dst, src_addr, offset_reg, offset_imm, protected_load_pc,
+                    needs_shift);
+}
+
 void LiftoffAssembler::LoadProtectedPointer(Register dst, Register src_addr,
                                             int32_t offset) {
   static_assert(!V8_ENABLE_SANDBOX_BOOL);
@@ -292,6 +302,14 @@ void LiftoffAssembler::StoreTaggedPointer(Register dst_addr,
                                   : Operand(actual_offset_reg),
       SaveFPRegsMode::kSave, StubCallMode::kCallWasmRuntimeStub);
   bind(&exit);
+}
+
+void LiftoffAssembler::AtomicStoreTaggedPointer(
+    Register dst_addr, Register offset_reg, int32_t offset_imm, Register src,
+    LiftoffRegList pinned, AtomicMemoryOrder memory_order,
+    uint32_t* protected_store_pc) {
+  AtomicStore(dst_addr, offset_reg, offset_imm, LiftoffRegister(src),
+              StoreType::kI32Store, pinned, false);
 }
 
 void LiftoffAssembler::Load(LiftoffRegister dst, Register src_addr,
@@ -671,6 +689,8 @@ void LiftoffAssembler::AtomicLoad(LiftoffRegister dst, Register src_addr,
     case LoadType::kI32Load8U:
     case LoadType::kI32Load16U:
     case LoadType::kI32Load:
+    case LoadType::kI32Load8S:
+    case LoadType::kI32Load16S:
       dst_reg = dst.gp();
       break;
     case LoadType::kI64Load8U:
@@ -694,6 +714,16 @@ void LiftoffAssembler::AtomicLoad(LiftoffRegister dst, Register src_addr,
       fence(PSR | PSW, PSR | PSW);
       lhu(dst_reg, src_reg, 0);
       fence(PSR, PSR | PSW);
+      return;
+    case LoadType::kI32Load8S:
+      fence(PSR | PSW, PSR | PSW);
+      lb(dst_reg, src_reg, 0);
+      fence(PSR | PSW, PSR | PSW);
+      return;
+    case LoadType::kI32Load16S:
+      fence(PSR | PSW, PSR | PSW);
+      lh(dst_reg, src_reg, 0);
+      fence(PSR | PSW, PSR | PSW);
       return;
     case LoadType::kI32Load:
     case LoadType::kI64Load32U:
@@ -917,6 +947,45 @@ void LiftoffAssembler::AtomicExchange(Register dst_addr, Register offset_reg,
   }
   liftoff::AtomicBinop(this, dst_addr, offset_reg, offset_imm, value, result,
                        type, liftoff::Binop::kExchange);
+}
+
+void LiftoffAssembler::AtomicExchangeTaggedPointer(
+    Register dst_addr, Register offset_reg, uintptr_t offset_imm,
+    LiftoffRegister value, LiftoffRegister result, LiftoffRegList pinned) {
+  {
+    UseScratchRegisterScope temps(this);
+    Register actual_addr = liftoff::CalculateActualAddress(
+        this, temps, dst_addr, offset_reg, offset_imm);
+    amoswap_w(true, true, result.gp(), actual_addr, value.gp());
+  }
+  if (v8_flags.disable_write_barriers) return;
+  // Emit the write barrier.
+  Label exit;
+  CheckPageFlag(dst_addr, MemoryChunk::kPointersFromHereAreInterestingMask,
+                kZero, &exit);
+  JumpIfSmi(value.gp(), &exit);
+  CheckPageFlag(value.gp(), MemoryChunk::kPointersToHereAreInterestingMask, eq,
+                &exit);
+
+  UseScratchRegisterScope temps{this};
+  Register actual_offset_reg = offset_reg;
+  if (offset_reg != no_reg && offset_imm != 0) {
+    if (cache_state()->is_used(LiftoffRegister(offset_reg))) {
+      // The code below only needs a scratch register if the {MemOperand} given
+      // to {str} has an offset outside the uint12 range. After doing the
+      // addition below we will not pass an immediate offset to {str} though, so
+      // we can use the scratch register here.
+      actual_offset_reg = temps.Acquire();
+    }
+    AddWord(actual_offset_reg, offset_reg, Operand(offset_imm));
+  }
+
+  CallRecordWriteStubSaveRegisters(
+      dst_addr,
+      actual_offset_reg == no_reg ? Operand(offset_imm)
+                                  : Operand(actual_offset_reg),
+      SaveFPRegsMode::kSave, StubCallMode::kCallWasmRuntimeStub);
+  bind(&exit);
 }
 
 void LiftoffAssembler::AtomicCompareExchange(

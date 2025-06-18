@@ -29,6 +29,7 @@
 #include "src/objects/js-generator.h"
 #include "src/objects/objects-inl.h"
 #include "src/objects/smi.h"
+#include "src/sandbox/indirect-pointer-tag.h"
 
 #if V8_ENABLE_WEBASSEMBLY
 #include "src/wasm/baseline/liftoff-assembler-defs.h"
@@ -450,6 +451,7 @@ void Generate_JSEntryVariant(MacroAssembler* masm, StackFrame::Type type,
   ExternalReference context_address = ExternalReference::Create(
       IsolateAddressId::kContextAddress, masm->isolate());
   __ Load(kScratchRegister, context_address);
+
   static constexpr int kOffsetToContextSlot = -2 * kSystemPointerSize;
   __ movq(Operand(rbp, kOffsetToContextSlot), kScratchRegister);
 
@@ -467,6 +469,11 @@ void Generate_JSEntryVariant(MacroAssembler* masm, StackFrame::Type type,
   __ bind(&not_outermost_js);
   __ Push(Immediate(StackFrame::INNER_JSENTRY_FRAME));
   __ bind(&cont);
+
+  // This builtins transitions into sandboxed execution mode.
+  // TODO(350324877): here we don't need to preserve rax/rcx/rdx, so we could
+  // optimize EnterSandbox to not push/pop any registers.
+  __ EnterSandbox();
 
   // Jump to a faked try block that does the invoke, with a faked catch
   // block that sets the exception.
@@ -497,6 +504,9 @@ void Generate_JSEntryVariant(MacroAssembler* masm, StackFrame::Type type,
   __ PopStackHandler();
 
   __ bind(&exit);
+  // TODO(350324877): here we only need to preserve rax, so we could optimize
+  // EnterSandbox to only push/pop that register.
+  __ ExitSandbox();
   // Check if the current stack frame is marked as the outermost JS frame.
   __ Pop(rbx);
   __ cmpq(rbx, Immediate(StackFrame::OUTERMOST_JSENTRY_FRAME));
@@ -618,6 +628,10 @@ static void Generate_JSEntryTrampolineHelper(MacroAssembler* masm,
     ExternalReference context_address = ExternalReference::Create(
         IsolateAddressId::kContextAddress, masm->isolate());
     __ movq(rsi, masm->ExternalReferenceAsOperand(context_address));
+#ifdef DEBUG
+    __ Move(__ ExternalReferenceAsOperand(context_address),
+            Context::kNoContext);
+#endif  // DEBUG
 
     // Push the function onto the stack.
     __ Push(rdi);
@@ -1106,6 +1120,8 @@ void ResetFeedbackVectorOsrUrgency(MacroAssembler* masm,
 void Builtins::Generate_InterpreterEntryTrampoline(
     MacroAssembler* masm, InterpreterEntryTrampolineMode mode) {
   Register closure = rdi;
+
+  __ AssertInSandboxedExecutionMode();
 
   // Get the bytecode array from the function object and load it into
   // kInterpreterBytecodeArrayRegister.
@@ -1753,6 +1769,8 @@ void Builtins::Generate_InterpreterPushArgsThenFastConstructFunction(
 }
 
 static void Generate_InterpreterEnterBytecode(MacroAssembler* masm) {
+  __ AssertInSandboxedExecutionMode();
+
   // Set the return address to the correct point in the interpreter entry
   // trampoline.
   Label builtin_trampoline, trampoline_loaded;
@@ -2018,15 +2036,16 @@ void Builtins::Generate_BaselineOutOfLinePrologue(MacroAssembler* masm) {
       FrameScope inner_frame_scope(masm, StackFrame::INTERNAL);
       // Save incoming new target or generator
       __ Push(new_target);
-#ifdef V8_ENABLE_LEAPTIERING
+#ifdef V8_JS_LINKAGE_INCLUDES_DISPATCH_HANDLE
       // No need to SmiTag as dispatch handles always look like Smis.
       static_assert(kJSDispatchHandleShift > 0);
+      __ AssertSmi(kJavaScriptCallDispatchHandleRegister);
       __ Push(kJavaScriptCallDispatchHandleRegister);
 #endif
       __ SmiTag(frame_size);
       __ Push(frame_size);
       __ CallRuntime(Runtime::kStackGuardWithGap, 1);
-#ifdef V8_ENABLE_LEAPTIERING
+#ifdef V8_JS_LINKAGE_INCLUDES_DISPATCH_HANDLE
       __ Pop(kJavaScriptCallDispatchHandleRegister);
 #endif
       __ Pop(new_target);
@@ -3523,11 +3542,10 @@ void GetContextFromImplicitArg(MacroAssembler* masm, Register data) {
 
 void RestoreParentSuspender(MacroAssembler* masm, Register tmp1) {
   Register suspender = tmp1;
-  __ LoadRoot(suspender, RootIndex::kActiveSuspender);
-  __ LoadTaggedField(
+  __ LoadRootRelative(suspender, IsolateData::active_suspender_offset());
+  __ LoadProtectedPointerField(
       suspender, FieldOperand(suspender, WasmSuspenderObject::kParentOffset));
-  __ CompareRoot(suspender, RootIndex::kUndefinedValue);
-  __ movq(masm->RootAsOperand(RootIndex::kActiveSuspender), suspender);
+  __ StoreRootRelative(IsolateData::active_suspender_offset(), suspender);
 }
 
 void ResetStackSwitchFrameStackSlots(MacroAssembler* masm) {
@@ -3604,7 +3622,7 @@ void SwitchBackAndReturnPromise(MacroAssembler* masm, Register tmp1,
   Register return_value = desc.GetRegisterParameter(1);
   if (mode == wasm::kPromise) {
     __ movq(return_value, kReturnRegister0);
-    __ LoadRoot(promise, RootIndex::kActiveSuspender);
+    __ LoadRootRelative(promise, IsolateData::active_suspender_offset());
     __ LoadTaggedField(
         promise, FieldOperand(promise, WasmSuspenderObject::kPromiseOffset));
   }
@@ -3650,7 +3668,7 @@ void GenerateExceptionHandlingLandingPad(MacroAssembler* masm,
   Register reason = desc.GetRegisterParameter(1);
   Register debug_event = desc.GetRegisterParameter(2);
   __ movq(reason, kReturnRegister0);
-  __ LoadRoot(promise, RootIndex::kActiveSuspender);
+  __ LoadRootRelative(promise, IsolateData::active_suspender_offset());
   __ LoadTaggedField(
       promise, FieldOperand(promise, WasmSuspenderObject::kPromiseOffset));
   __ movq(kContextRegister,
@@ -3969,9 +3987,9 @@ void Builtins::Generate_WasmSuspend(MacroAssembler* masm) {
   __ Move(caller, MemOperand(suspender_stack, wasm::kStackParentOffset));
   __ StoreRootRelative(IsolateData::active_stack_offset(), caller);
   Register parent = rdx;
-  __ LoadTaggedField(
+  __ LoadProtectedPointerField(
       parent, FieldOperand(suspender, WasmSuspenderObject::kParentOffset));
-  __ movq(masm->RootAsOperand(RootIndex::kActiveSuspender), parent);
+  __ StoreRootRelative(IsolateData::active_suspender_offset(), parent);
   parent = no_reg;
   // live: [suspender:rax, stack:rbx, caller:rcx]
 
@@ -4028,8 +4046,10 @@ void Generate_WasmResumeHelper(MacroAssembler* masm, wasm::OnResume on_resume) {
   // The write barrier uses a fixed register for the host object (rdi). The next
   // barrier is on the suspender, so load it in rdi directly.
   Register suspender = rdi;
-  __ LoadTaggedField(
-      suspender, FieldOperand(resume_data, WasmResumeData::kSuspenderOffset));
+  __ LoadTrustedPointerField(
+      suspender,
+      FieldOperand(resume_data, WasmResumeData::kTrustedSuspenderOffset),
+      kWasmSuspenderIndirectPointerTag, kScratchRegister);
   closure = no_reg;
   sfi = no_reg;
 
@@ -4050,13 +4070,19 @@ void Generate_WasmResumeHelper(MacroAssembler* masm, wasm::OnResume on_resume) {
   Register slot_address = WriteBarrierDescriptor::SlotAddressRegister();
   // Check that the fixed register isn't one that is already in use.
   DCHECK(slot_address == rbx || slot_address == r8);
-  __ LoadRoot(active_suspender, RootIndex::kActiveSuspender);
+  __ LoadRootRelative(active_suspender, IsolateData::active_suspender_offset());
+  // TODO(350324877): we shouldn't exit sandboxed mode here. We can either:
+  //   * call a (unsandboxed) runtime function/builtin
+  //   * run this entire builtin in unsandboxed mode, or
+  //   * find a way to avoid this write entirely.
+  __ ExitSandbox();
   __ StoreTaggedField(
       FieldOperand(suspender, WasmSuspenderObject::kParentOffset),
       active_suspender);
+  __ EnterSandbox();
   __ RecordWriteField(suspender, WasmSuspenderObject::kParentOffset,
                       active_suspender, slot_address, SaveFPRegsMode::kIgnore);
-  __ movq(masm->RootAsOperand(RootIndex::kActiveSuspender), suspender);
+  __ StoreRootRelative(IsolateData::active_suspender_offset(), suspender);
 
   Register target_stack = suspender;
   __ LoadExternalPointerField(
@@ -4222,6 +4248,18 @@ void Builtins::Generate_CEntry(MacroAssembler* masm, int result_size,
 
   using ER = ExternalReference;
 
+  // TODO(422994386): At the moment, all C++ code expects to run unsandboxed.
+  // In the future, we should be able to also run C++ builtins and runtime
+  // functions in sandboxed execution mode. At that point, we'll either need a
+  // dedicated CEntry variants for switching out of sandboxed execution mode or
+  // we'll need to perform the mode switch at the start of the CPP function.
+  // The latter is only possible if we do not want/need to eventually require
+  // going through dedicated trampoline builtins for switching the sandboxing
+  // mode, so that needs to be taken into account.
+  __ ExitSandbox();
+  // This builtins transitions out of sandboxed execution mode.
+  __ SetSandboxingModeForCurrentBuiltin(CodeSandboxingMode::kUnsandboxed);
+
   // rax: number of arguments including receiver
   // rbx: pointer to C function  (C callee-saved)
   // rbp: frame pointer of calling JS frame (restored after C call)
@@ -4352,6 +4390,7 @@ void Builtins::Generate_CEntry(MacroAssembler* masm, int result_size,
     __ leaq(rsp, Operand(kArgvRegister, kReceiverOnStackSize));
     __ PushReturnAddressFrom(rcx);
   }
+  __ EnterSandbox();
   __ ret(0);
 
   // Handling of exception.
@@ -4386,6 +4425,8 @@ void Builtins::Generate_CEntry(MacroAssembler* masm, int result_size,
                    num_frames_above_pending_handler_address));
   __ IncsspqIfSupported(rcx, kScratchRegister);
 #endif  // V8_ENABLE_CET_SHADOW_STACK
+
+  __ EnterSandbox();
 
   // Retrieve the handler context, SP and FP.
   __ movq(rsi,
@@ -4827,6 +4868,10 @@ void Generate_DeoptimizationEntry(MacroAssembler* masm,
                                   DeoptimizeKind deopt_kind) {
   Isolate* isolate = masm->isolate();
 
+  __ ExitSandbox();
+  // This builtins transitions out of sandboxed execution mode.
+  __ SetSandboxingModeForCurrentBuiltin(CodeSandboxingMode::kUnsandboxed);
+
   // Save all xmm (simd / double) registers, they will later be copied to the
   // deoptimizer's FrameDescription.
   static constexpr int kXmmRegsSize = kSimd128Size * XMMRegister::kNumRegisters;
@@ -5018,6 +5063,8 @@ void Generate_DeoptimizationEntry(MacroAssembler* masm,
   __ movb(__ ExternalReferenceAsOperand(IsolateFieldId::kStackIsIterable),
           Immediate(1));
 
+  __ EnterSandbox();
+
   // Return to the continuation point.
   __ ret(0);
 
@@ -5078,6 +5125,56 @@ void Builtins::Generate_DeoptimizationEntry_Eager(MacroAssembler* masm) {
 
 void Builtins::Generate_DeoptimizationEntry_Lazy(MacroAssembler* masm) {
   Generate_DeoptimizationEntry(masm, DeoptimizeKind::kLazy);
+}
+
+void Builtins::Generate_DeoptimizationEntry_LazyAfterFastCall(
+    MacroAssembler* masm) {
+  // The deoptimizer may have been triggered right after the return of a fast
+  // API call. In that case, exception handling and possible stack unwinding
+  // did not happen yet.
+  // We check here if a there is a pending exception by comparing the
+  // exception stored in the isolate with the no-exception sentinel
+  // (the_hole_value). If there is an exception, we call PropagateException to
+  // trigger stack unwinding.
+  Label no_exception;
+  __ movq(rax, __ ExternalReferenceAsOperand(ExternalReference::Create(
+                   IsolateAddressId::kExceptionAddress, __ isolate())));
+  __ CompareRoot(rax, RootIndex::kTheHoleValue);
+
+  __ j(equal, &no_exception);
+
+  __ EnterFrame(StackFrame::INTERNAL);
+  const RegList kCalleeSaveRegisters = {C_CALL_CALLEE_SAVE_REGISTERS};
+  const DoubleRegList kCalleeSaveFPRegisters = {
+      C_CALL_CALLEE_SAVE_FP_REGISTERS};
+  __ PushAll(kCalleeSaveFPRegisters);
+  __ PushAll(kCalleeSaveRegisters);
+  __ Move(kContextRegister, Context::kNoContext);
+  // We have to reset IsolateData::fast_c_call_caller_fp(), because otherwise
+  // the  stack unwinder thinks that we are still within the fast C call.
+  if (v8_flags.debug_code) {
+    __ movq(rax,
+            __ ExternalReferenceAsOperand(IsolateFieldId::kFastCCallCallerFP));
+    __ testq(rax, rax);
+    __ Assert(not_equal, AbortReason::kFastCallFallbackInvalid);
+  }
+  __ movq(__ ExternalReferenceAsOperand(IsolateFieldId::kFastCCallCallerFP),
+          Immediate(0));
+  __ CallRuntime(Runtime::FunctionId::kPropagateException);
+  __ PopAll(kCalleeSaveRegisters);
+  __ PopAll(kCalleeSaveFPRegisters);
+  __ LeaveFrame(StackFrame::INTERNAL);
+
+  __ bind(&no_exception);
+  // LINT.IfChange(DeoptAfterFastCallSetReturnValue)
+  // Deoptimization expects that the return value of the API call is in the
+  // return register. As we only allow deoptimization if the return type is
+  // void, the return value is always `undefined`.
+  // TODO(crbug.com/418936518): Handle the return value in an actual
+  // deoptimization continuation.
+  __ LoadRoot(kReturnRegister0, RootIndex::kUndefinedValue);
+  // LINT.ThenChange()
+  __ TailCallBuiltin(Builtin::kDeoptimizationEntry_Lazy);
 }
 
 // If there is baseline code on the shared function info, converts an

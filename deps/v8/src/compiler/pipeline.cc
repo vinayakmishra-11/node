@@ -124,10 +124,12 @@
 #include "src/compiler/wasm-gc-operator-reducer.h"
 #include "src/compiler/wasm-load-elimination.h"
 #include "src/compiler/wasm-typer.h"
+#include "src/wasm/basic-block-calculator.h"
 #include "src/wasm/function-body-decoder.h"
 #include "src/wasm/function-compiler.h"
 #include "src/wasm/turboshaft-graph-interface.h"
 #include "src/wasm/wasm-builtin-list.h"
+#include "src/wasm/wasm-code-coverage.h"
 #include "src/wasm/wasm-disassembler.h"
 #include "src/wasm/wasm-engine.h"
 
@@ -778,11 +780,11 @@ PipelineCompilationJob::Status PipelineCompilationJob::ExecuteJobImpl(
 
   if (V8_UNLIKELY(v8_flags.turbolev)) {
     if (!turboshaft_pipeline.CreateGraphWithMaglev(linkage_)) {
-      return AbortOptimization(BailoutReason::kGraphBuildingFailed);
+      return AbortOptimization(BailoutReason::kTurbofanGraphBuildingFailed);
     }
   } else {
     if (!pipeline_.CreateGraph(linkage_)) {
-      return AbortOptimization(BailoutReason::kGraphBuildingFailed);
+      return AbortOptimization(BailoutReason::kTurbofanGraphBuildingFailed);
     }
 
     // We selectively Unpark inside OptimizeTurbofanGraph.
@@ -816,13 +818,13 @@ PipelineCompilationJob::Status PipelineCompilationJob::FinalizeJobImpl(
   MaybeHandle<Code> maybe_code = turboshaft_pipeline.FinalizeCode();
   if (!maybe_code.ToHandle(&code)) {
     if (compilation_info()->bailout_reason() == BailoutReason::kNoReason) {
-      return AbortOptimization(BailoutReason::kCodeGenerationFailed);
+      return AbortOptimization(BailoutReason::kTurbofanCodeGenerationFailed);
     }
     return FAILED;
   }
   context = DirectHandle<NativeContext>(compilation_info()->native_context(),
                                         isolate);
-  if (context->IsDetached()) {
+  if (context->IsDetached(isolate)) {
     return AbortOptimization(BailoutReason::kDetachedNativeContext);
   }
   if (!CheckNoDeprecatedMaps(code, isolate)) {
@@ -865,17 +867,20 @@ struct GraphBuilderPhase {
 
     JSHeapBroker* broker = data->broker();
     UnparkedScopeIfNeeded scope(broker);
-    JSFunctionRef closure = MakeRef(broker, data->info()->closure());
+    SharedFunctionInfoRef sfi_ref =
+        MakeRef(broker, data->info()->closure()->shared());
+    FeedbackCellRef feedback_cell_ref =
+        MakeRef(broker, data->info()->closure()->raw_feedback_cell());
     BytecodeArrayRef bytecode = MakeRef(broker, data->info()->bytecode_array());
     CallFrequency frequency(1.0f);
-    BuildGraphFromBytecode(
-        broker, temp_zone, closure.shared(broker), bytecode,
-        closure.raw_feedback_cell(broker), data->info()->osr_offset(),
-        data->jsgraph(), frequency, data->source_positions(),
-        data->node_origins(), SourcePosition::kNotInlined,
-        data->info()->code_kind(), flags, &data->info()->tick_counter(),
-        ObserveNodeInfo{data->observe_node_manager(),
-                        data->info()->node_observer()});
+    BuildGraphFromBytecode(broker, temp_zone, sfi_ref, bytecode,
+                           feedback_cell_ref, data->info()->osr_offset(),
+                           data->jsgraph(), frequency, data->source_positions(),
+                           data->node_origins(), SourcePosition::kNotInlined,
+                           data->info()->code_kind(), flags,
+                           &data->info()->tick_counter(),
+                           ObserveNodeInfo{data->observe_node_manager(),
+                                           data->info()->node_observer()});
 
     // We need to be certain that the parameter count reported by our output
     // Code object matches what the code we compile expects. Otherwise, this
@@ -2220,10 +2225,13 @@ const ProfileDataFromFile* ValidateProfileData(
     if (v8_flags.abort_on_bad_builtin_profile_data ||
         v8_flags.warn_about_builtin_profile_data) {
       base::EmbeddedVector<char, 256> msg;
-      SNPrintF(msg,
-               "Rejected profile data for %s due to function change. "
-               "Please use tools/builtins-pgo/generate.py to refresh it.",
-               debug_name);
+      SNPrintF(
+          msg,
+          "Rejected profile data for %s due to function change. "
+          "Please use tools/builtins-pgo/generate.py to refresh it, you can "
+          "also try adding `'checkout_pgo_profiles': True` to your .gclient "
+          "file and run `gclient sync` to download the latest PGO profiles.",
+          debug_name);
       if (v8_flags.abort_on_bad_builtin_profile_data) {
         // mksnapshot might fail here because of the following reasons:
         // * builtins were changed since the builtins profile generation,
@@ -2280,7 +2288,7 @@ CodeAssemblerCompilationJob::CodeAssemblerCompilationJob(
       generator_(generator),
       installer_(installer),
       profile_data_(profile_data),
-      zone_(isolate->allocator(), ZONE_NAME, kCompressGraphZone),
+      zone_(isolate->allocator(), ZONE_NAME),
       zone_stats_(isolate->allocator()),
       code_assembler_state_(isolate, &zone_, get_call_descriptor(&zone_),
                             code_kind, name, builtin),
@@ -2693,7 +2701,7 @@ Pipeline::GenerateCodeForWasmNativeStubFromTurboshaft(
     const char* debug_name, const AssemblerOptions& options,
     SourcePositionTable* source_positions) {
   wasm::WasmEngine* wasm_engine = wasm::GetWasmEngine();
-  Zone zone(wasm_engine->allocator(), ZONE_NAME, kCompressGraphZone);
+  Zone zone(wasm_engine->allocator(), ZONE_NAME);
   WasmCallKind call_kind =
       wrapper_info.code_kind == CodeKind::WASM_TO_JS_FUNCTION
           ? WasmCallKind::kWasmImportWrapper
@@ -2823,7 +2831,7 @@ wasm::WasmCompilationResult Pipeline::GenerateWasmCode(
   }
   ZoneStats zone_stats(wasm_engine->allocator());
 
-  Zone graph_zone{wasm_engine->allocator(), ZONE_NAME, kCompressGraphZone};
+  Zone graph_zone{wasm_engine->allocator(), ZONE_NAME};
   OptimizedCompilationInfo info(
       GetDebugName(&graph_zone, env->module,
                    compilation_data.wire_bytes_storage,
@@ -2881,6 +2889,27 @@ wasm::WasmCompilationResult Pipeline::GenerateWasmCode(
   Zone inlining_positions_zone(wasm_engine->allocator(), ZONE_NAME);
   ZoneVector<WasmInliningPosition> inlining_positions(&inlining_positions_zone);
 
+  wasm::WasmFunctionCoverageData* function_coverage_data = nullptr;
+  if (V8_UNLIKELY(v8_flags.wasm_code_coverage)) {
+    DCHECK_NOT_NULL(env->module_coverage_data);
+    int declared_function_index =
+        wasm::declared_function_index(env->module, compilation_data.func_index);
+    function_coverage_data = env->module_coverage_data->GetFunctionCoverageData(
+        declared_function_index);
+    if (!function_coverage_data) {
+      // There can be a race here, if another thread finds that
+      // GetFunctionCoverageData() returns nullptr, but in that case we would
+      // just waste some time calling ComputeBasicBlocks().
+      size_t func_body_size =
+          compilation_data.func_body.end - compilation_data.func_body.start;
+      wasm::BasicBlockCalculator basic_block_calculator(
+          &graph_zone, {compilation_data.func_body.start, func_body_size});
+      basic_block_calculator.ComputeBasicBlocks();
+      function_coverage_data = env->module_coverage_data->InstallCoverageData(
+          declared_function_index, basic_block_calculator.GetCodeRanges());
+    }
+  }
+
   turboshaft::PipelineData turboshaft_data(
       &zone_stats, turboshaft::TurboshaftPipelineKind::kWasm, nullptr, &info,
       options);
@@ -2901,7 +2930,7 @@ wasm::WasmCompilationResult Pipeline::GenerateWasmCode(
                      turboshaft_data.graph(), compilation_data.func_body,
                      compilation_data.wire_bytes_storage,
                      &compilation_data.assumptions, &inlining_positions,
-                     compilation_data.func_index);
+                     compilation_data.func_index, function_coverage_data);
   CodeTracer* code_tracer = nullptr;
   if (turboshaft_data.info()->trace_turbo_graph()) {
     // NOTE: We must not call `GetCodeTracer` if tracing is not enabled,

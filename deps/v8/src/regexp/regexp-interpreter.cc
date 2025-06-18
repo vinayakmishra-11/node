@@ -578,12 +578,12 @@ IrregexpInterpreter::Result RawMatch(
       ADVANCE_CURRENT_POSITION(LoadPacked24Signed(insn));
       DISPATCH();
     }
-    BYTECODE(CHECK_GREEDY) {
+    BYTECODE(CHECK_FIXED_LENGTH) {
       if (current == backtrack_stack.peek()) {
         SET_PC_FROM_OFFSET(Load32Aligned(pc + 4));
         backtrack_stack.pop();
       } else {
-        ADVANCE(CHECK_GREEDY);
+        ADVANCE(CHECK_FIXED_LENGTH);
       }
       DISPATCH();
     }
@@ -1181,6 +1181,9 @@ int IrregexpInterpreter::MatchForCallFromJs(
     Address subject, int32_t start_position, Address, Address,
     int* output_registers, int32_t output_register_count,
     RegExp::CallOrigin call_origin, Isolate* isolate, Address regexp_data) {
+  // TODO(422992937): investigate running the interpreter in sandboxed mode.
+  ExitSandboxScope unsandboxed;
+
   DCHECK_NOT_NULL(isolate);
   DCHECK_NOT_NULL(output_registers);
   DCHECK(call_origin == RegExp::CallOrigin::kFromJs);

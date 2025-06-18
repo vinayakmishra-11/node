@@ -9,16 +9,18 @@
 #error This header should only be included if WebAssembly is enabled.
 #endif  // !V8_ENABLE_WEBASSEMBLY
 
-#include <unordered_map>
+#include <unordered_set>
 
 #include "src/base/bounds.h"
 #include "src/base/hashing.h"
+#include "src/base/platform/mutex.h"
+#include "src/wasm/struct-types.h"
 #include "src/wasm/value-type.h"
-#include "src/wasm/wasm-module.h"
 
 namespace v8::internal::wasm {
 
 class CanonicalTypeNamesProvider;
+struct WasmModule;
 
 // We use ValueType instances constructed from canonical type indices, so we
 // can't let them get bigger than what we have storage space for.
@@ -293,7 +295,12 @@ class TypeCanonicalizer {
       }
     }
 
-    size_t hash() const { return hasher.hash(); }
+    size_t hash() const {
+#if V8_HASHES_COLLIDE
+      if (v8_flags.hashes_collide) return base::kCollidingHash;
+#endif  // V8_HASHES_COLLIDE
+      return hasher.hash();
+    }
   };
 
   // Support for equality checking of recursion groups, where type indexes have

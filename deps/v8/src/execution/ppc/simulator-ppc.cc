@@ -3563,7 +3563,12 @@ void Simulator::ExecuteGeneric(Instruction* instr) {
       int frb = instr->RBValue();
       double fra_val = get_double_from_d_register(fra);
       double frb_val = get_double_from_d_register(frb);
-      double frt_val = fra_val - frb_val;
+      double frt_val;
+      if (std::isinf(fra_val) && std::isinf(frb_val) && (fra_val == frb_val)) {
+        frt_val = std::numeric_limits<double>::quiet_NaN();
+      } else {
+        frt_val = fra_val - frb_val;
+      }
       set_d_register_from_double(frt, frt_val);
       return;
     }
@@ -3573,7 +3578,12 @@ void Simulator::ExecuteGeneric(Instruction* instr) {
       int frb = instr->RBValue();
       double fra_val = get_double_from_d_register(fra);
       double frb_val = get_double_from_d_register(frb);
-      double frt_val = fra_val + frb_val;
+      double frt_val;
+      if (std::isinf(fra_val) && std::isinf(frb_val) && (fra_val != frb_val)) {
+        frt_val = std::numeric_limits<double>::quiet_NaN();
+      } else {
+        frt_val = fra_val + frb_val;
+      }
       set_d_register_from_double(frt, frt_val);
       return;
     }
@@ -5096,12 +5106,13 @@ void Simulator::ExecuteGeneric(Instruction* instr) {
       break;
     }
 #undef VECTOR_ADD_SUB_SATURATE
-#define VECTOR_FP_ROUNDING(type, op)                       \
-  int t = instr->RTValue();                                \
-  int b = instr->RBValue();                                \
-  FOR_EACH_LANE(i, type) {                                 \
-    type b_val = get_simd_register_by_lane<type>(b, i);    \
-    set_simd_register_by_lane<type>(t, i, std::op(b_val)); \
+#define VECTOR_FP_ROUNDING(type, op)                                           \
+  int t = instr->RTValue();                                                    \
+  int b = instr->RBValue();                                                    \
+  FOR_EACH_LANE(i, type) {                                                     \
+    type b_val = get_simd_register_by_lane<type>(b, i);                        \
+    set_simd_register_by_lane<type>(t, i,                                      \
+                                    std::isnan(b_val) ? NAN : std::op(b_val)); \
   }
     case XVRDPIP: {
       VECTOR_FP_ROUNDING(double, ceil)
